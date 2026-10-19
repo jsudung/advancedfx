@@ -373,6 +373,27 @@ What we do:
 - Lines are built with `ILocalize::Find` (vtable index read from the handler) and our own
   `%sN` substitution.
 
+### Enemy radio voice lines
+
+GOTV demos contain every agent voice line (`<agent>.<t|ct>_<concept><nn>`, e.g.
+`sas.ct_flashbang02`, from `soundevents/vo/agents/*.vsndevts`) as `CMsgSosStartSoundEvent`
+(svc 208). A player only gets their own team's, played as radio. In the MM test demo, every
+sound from a player pawn without `packed_params` was agent VO (416), and every other pawn
+sound had them (19017). Names were checked by decompressing the vsndevts KV3 (LZ4) and
+hashing with MurmurHash2, seed `0x53524332`, on the lowercase name.
+
+The message's `_InternalParse` (vtable[9], ~0x5fc020) is detoured. Field offsets come from
+`_InternalSerialize` (vtable[11]): has-bits +0x10 (1 `packed_params` +0x18, 2 guid +0x20,
+4 hash +0x24, 8 seed +0x28, 0x10 start_time +0x2c, 0x20 `source_entity_index` +0x30).
+After parsing, when the message has no `packed_params` and its source is an enemy pawn of the
+target, the hash and its has-bit are cleared, so nothing plays. Parsing may run off the main
+thread, so the hook only reads a byte table of muted pawn indices, which the main thread
+rebuilds every frame.
+
+The radio chat sound: the RadioText handler plays `HudChat.Message` through
+`EmitSound(-1, &params)` (~0xc09410) unless `cl_clutch_mode`. We do the same after our radio
+lines.
+
 ## Packaged as mirv_pov
 
 The spike was packaged as `mirv_pov <idx> | 0 | list | info` (code: `AfxHookSource2/MirvPov.*`),

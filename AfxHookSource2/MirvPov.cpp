@@ -116,6 +116,42 @@ EmitSound_t g_EmitSound = nullptr;
 unsigned char ** g_ppClutchModeCvar = nullptr; // cl_clutch_mode
 ptrdiff_t g_OfsClutchModeValue = 0;
 
+// Radio voice lines: GOTV gets every agent VO line (sas.ct_flashbang02, ...) as a sound event,
+// players only get their own team's. CMsgSosStartSoundEvent from a player pawn without packed params
+// (position) is agent VO (all other pawn sounds have a position). We detour the message's parse
+// function and clear the sound event hash of enemy VO, so nothing plays. Parsing may not happen on
+// the main thread, so it only reads g_MuteVoPawn, which the main thread fills each frame.
+typedef const char * (__fastcall * SosStartSoundEvent_Parse_t)(void * pMsg, const char * ptr, void * pCtx);
+SosStartSoundEvent_Parse_t g_Org_SosStartSoundEvent_Parse = nullptr;
+ptrdiff_t g_OfsSosHash = 0;
+ptrdiff_t g_OfsSosSourceEntity = 0;
+const ptrdiff_t c_OfsSosHasBits = 0x10;
+const unsigned int c_SosHasPackedParams = 1;
+const unsigned int c_SosHasHash = 4;
+const unsigned int c_SosHasSourceEntity = 0x20;
+const int c_MuteVoMaxEntities = 16384;
+volatile unsigned char g_MuteVoPawn[c_MuteVoMaxEntities] = {};
+volatile bool g_MuteVoActive = false;
+volatile long g_MuteVoCount = 0; // diagnostics
+bool g_PovMuteEnemyRadio = true;
+
+const char * __fastcall New_SosStartSoundEvent_Parse(void * pMsg, const char * ptr, void * pCtx) {
+	const char * pResult = g_Org_SosStartSoundEvent_Parse(pMsg, ptr, pCtx);
+	if (g_MuteVoActive && nullptr != pResult) {
+		unsigned char * p = (unsigned char *)pMsg;
+		unsigned int hasBits = *(unsigned int *)(p + c_OfsSosHasBits);
+		if (0 == (hasBits & c_SosHasPackedParams) && 0 != (hasBits & c_SosHasSourceEntity)) {
+			int source = *(int *)(p + g_OfsSosSourceEntity);
+			if (0 <= source && source < c_MuteVoMaxEntities && g_MuteVoPawn[source]) {
+				*(unsigned int *)(p + g_OfsSosHash) = 0;
+				*(unsigned int *)(p + c_OfsSosHasBits) = hasBits & ~c_SosHasHash;
+				InterlockedIncrement(&g_MuteVoCount);
+			}
+		}
+	}
+	return pResult;
+}
+
 // As local player the target's pawn (and its weapons / viewmodel) becomes predictable, so the
 // client shows its own predicted copy of some values instead of the recorded ones. Without user
 // input that copy freezes. C_BaseEntity::SetPredictable (vtable index 130) is detoured to keep
@@ -905,7 +941,10 @@ void PrintInfo() {
 			(unsigned long long)g_clientDllOffsets.CCSPlayerController.m_pInGameMoneyServices,
 			(unsigned long long)g_clientDllOffsets.CCSPlayerController_InGameMoneyServices.m_iAccount,
 			(unsigned long long)g_clientDllOffsets.C_CSPlayerPawn.m_szLastPlaceName);
-		InfoPrintf("Chat sound: %s\n", nullptr != g_EmitSound ? "OK" : "MISSING");
+		InfoPrintf("Chat sound: %s | enemy radio mute: hook %s, on %i, active %i, muted so far %li (hash +0x%llx, source +0x%llx)\n",
+			nullptr != g_EmitSound ? "OK" : "MISSING", nullptr != g_Org_SosStartSoundEvent_Parse ? "OK" : "MISSING",
+			g_PovMuteEnemyRadio ? 1 : 0, g_MuteVoActive ? 1 : 0, g_MuteVoCount,
+			(unsigned long long)g_OfsSosHash, (unsigned long long)g_OfsSosSourceEntity);
 		InfoPrintf("Damage report: hook %s, on %i,sv_dev_damage_use_netvars %i, round win status %i, round %i, events %i, last result %i | spec target fix: %s, on %i\n",
 			nullptr != g_DmgReport.Report ? "OK" : "MISSING", g_PovDamageReport ? 1 : 0, useNetvars, winStatus,
 			nullptr != g_DmgReport.Report ? DamageReport_GetRound() : -1, (int)g_DmgEvents.size(), g_DmgLastResult,
@@ -1179,6 +1218,29 @@ void MirvPov_HookClientDll(HMODULE clientDll) {
 		} else advancedfx::Warning("mirv_pov: chat sound not found (radio lines without sound).\n");
 	}
 
+	// CMsgSosStartSoundEvent: vtable[9] = _InternalParse, vtable[11] = _InternalSerialize, whose
+	// "mov ecx, [rsi+hash]; mov byte ptr [rdx], 15h" / "movsxd rax, [rsi+source]; lea r8, [rdx+1]; mov byte ptr [rdx], 18h"
+	// give the field offsets.
+	if (void ** vtable = (void **)Afx::BinUtils::FindClassVtable(clientDll, ".?AVCMsgSosStartSoundEvent@@", 0, 0x0)) {
+		size_t serialize = (size_t)vtable[11];
+		Afx::BinUtils::MemRange serializeRange(serialize, serialize + 0x200);
+		Afx::BinUtils::MemRange hashResult = Afx::BinUtils::FindPatternString(serializeRange, "8B 4E ?? C6 02 15");
+		Afx::BinUtils::MemRange sourceResult = Afx::BinUtils::FindPatternString(serializeRange, "48 63 46 ?? 4C 8D 42 01 C6 02 18");
+		static const unsigned char parsePrologue[] = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x6C, 0x24, 0x20, 0x56, 0x41, 0x56, 0x41, 0x57 };
+		if (!hashResult.IsEmpty() && !sourceResult.IsEmpty() && BytesEqual((size_t)vtable[9], parsePrologue, sizeof(parsePrologue))) {
+			g_OfsSosHash = *(unsigned char *)(hashResult.Start + 2);
+			g_OfsSosSourceEntity = *(unsigned char *)(sourceResult.Start + 3);
+			g_Org_SosStartSoundEvent_Parse = (SosStartSoundEvent_Parse_t)vtable[9];
+			DetourTransactionBegin();
+			DetourUpdateThread(GetCurrentThread());
+			DetourAttach(&(PVOID &)g_Org_SosStartSoundEvent_Parse, New_SosStartSoundEvent_Parse);
+			if (NO_ERROR != DetourTransactionCommit()) {
+				g_Org_SosStartSoundEvent_Parse = nullptr;
+				advancedfx::Warning("mirv_pov: failed to detour CMsgSosStartSoundEvent parsing.\n");
+			}
+		} else advancedfx::Warning("mirv_pov: CMsgSosStartSoundEvent layout changed (enemy radio voice stays audible).\n");
+	} else advancedfx::Warning("mirv_pov: CMsgSosStartSoundEvent not found (enemy radio voice stays audible).\n");
+
 	// "spec_target_updated" sender (CCSObserver_ObserverServices): event = CreateEvent(..); SetPlayer("userid", pawn);
 	// mov rdi, [rcx+SetEntity] (+0xbf); ...; SetEntity("target", GetObserverTarget())
 	{
@@ -1262,11 +1324,13 @@ void MirvPov_HookEngine2Dll(HMODULE engine2Dll) {
 }
 
 static void ChatLines_OnFrame();
+static void MuteRadio_OnFrame();
 
 void MirvPov_BeforeFrameStageNotify(int curStage) {
 	SetScoreboardPatch(0 != g_HltvSpoofMode && nullptr != g_KillCamLastSwapped && 0 == g_KillCamSuspendFrames);
 
 	if (0 < g_KillCamSuspendFrames) {
+		g_MuteVoActive = false;
 		if (SOURCESDK::CS2::FRAME_RENDER_PASS == curStage) {
 			KillCam_OnSuspendedFrame();
 			if (0 == --g_KillCamSuspendFrames) g_KillCamSeekTargetTick = -1;
@@ -1278,6 +1342,7 @@ void MirvPov_BeforeFrameStageNotify(int curStage) {
 	if (SOURCESDK::CS2::FRAME_RENDER_PASS == curStage) {
 		DamageReport_OnFrame();
 		ChatLines_OnFrame();
+		MuteRadio_OnFrame();
 	}
 
 	// After a (re-)swap: undo the predictability the game just gave the target's entities.
@@ -1552,6 +1617,36 @@ static void ChatLines_OnWeaponFire(SOURCESDK::CS2::IGameEvent * pEvent) {
 	}
 	PrintChat(thrower - 1, line);
 	PlayChatSound();
+}
+
+// Marks the pawns whose VO New_SosStartSoundEvent_Parse drops: the target's enemies.
+static void MuteRadio_OnFrame() {
+	static int s_marked[64];
+	static int s_markedCount = 0;
+	int marked[64];
+	int markedCount = 0;
+	bool bActive = g_PovMuteEnemyRadio && nullptr != g_Org_SosStartSoundEvent_Parse && nullptr != g_KillCamLastSwapped && 0 == g_KillCamSuspendFrames;
+	if (bActive) {
+		int team = ((CEntityInstance *)g_KillCamLastSwapped)->GetTeam();
+		for (int i = 1; i <= 64 && markedCount < 64; ++i) {
+			CEntityInstance * pController = GetEntity(i);
+			if (nullptr == pController || !pController->IsPlayerController()) continue;
+			int otherTeam = pController->GetTeam();
+			if (otherTeam == team || (2 != otherTeam && 3 != otherTeam)) continue;
+			int pawn = pController->GetPlayerPawnHandle().GetEntryIndex();
+			if (pawn < 0 || c_MuteVoMaxEntities <= pawn) continue;
+			g_MuteVoPawn[pawn] = 1;
+			marked[markedCount++] = pawn;
+		}
+	}
+	for (int i = 0; i < s_markedCount; ++i) {
+		bool bStill = false;
+		for (int j = 0; j < markedCount; ++j) if (marked[j] == s_marked[i]) { bStill = true; break; }
+		if (!bStill) g_MuteVoPawn[s_marked[i]] = 0;
+	}
+	memcpy(s_marked, marked, sizeof(int) * markedCount);
+	s_markedCount = markedCount;
+	g_MuteVoActive = bActive;
 }
 
 // Kill rewards: queued on the target's kills, printed when their money changes (amount = change).
@@ -1882,6 +1977,16 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 			return;
 		}
 
+		if (0 == _stricmp(cmd, "enemyradio") && 3 <= argc) {
+			if (nullptr == g_Org_SosStartSoundEvent_Parse) {
+				advancedfx::Warning("mirv_pov: sound event hook not installed.\n");
+				return;
+			}
+			g_PovMuteEnemyRadio = 0 == atoi(args->ArgV(2));
+			advancedfx::Message("mirv_pov: enemy team radio voice %s.\n", g_PovMuteEnemyRadio ? "muted" : "audible");
+			return;
+		}
+
 		if ((0 == _stricmp(cmd, "radio") || 0 == _stricmp(cmd, "killreward")) && 3 <= argc) {
 			if (nullptr == g_ChatPrintf) {
 				advancedfx::Warning("mirv_pov: chat print not found.\n");
@@ -1940,10 +2045,11 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s damagearcs <0|1> - Damage direction arcs when the player gets hit (default 1).\n"
 		"%s radio <0|1> - Grenade radio chat lines of the player's team (default 1).\n"
 		"%s killreward <0|1> - Kill reward chat lines (default 1).\n"
+		"%s enemyradio <0|1> - 1 keeps the enemy team's radio voice lines audible (default 0, muted like for a player).\n"
 		"%s spectarget <0|1> - Make the demo UI's spectated player (and its markers) the POV player, also while dead (default 1).\n"
 		"%s chatlog <0|1> - Log chat (SayText2) messages arriving at the chat HUD.\n"
 		"%s hltvlog [0|1] - IsHLTV() caller logging on (resets) / off, without argument prints the callers.\n"
 		"%s diag <0|1> - Diagnostic logging to console and %%TEMP%%\\mirv_pov_log.txt (default 0).\n"
-		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
+		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
 	);
 }

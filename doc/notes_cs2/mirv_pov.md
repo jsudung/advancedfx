@@ -36,6 +36,7 @@ follow the POV player, also when seeking to a moment where they're dead.
 - Grenade radio lines of the player's team ("[CT] Name﹫Place: Flashbang!") and the player's
   kill reward lines (" +$300 for neutralizing an enemy with the AK-47"), rebuilt from the demo.
   Radio lines play the chat sound (not with `cl_clutch_mode 1`).
+- Only the player's own team's radio voice lines are heard (GOTV demos have both teams').
 
 ## Known limitations
 
@@ -64,6 +65,7 @@ follow the POV player, also when seeking to a moment where they're dead.
 | `damagearcs 0\|1` | 1 | Damage direction arcs |
 | `radio 0\|1` | 1 | Grenade radio chat lines |
 | `killreward 0\|1` | 1 | Kill reward chat lines |
+| `enemyradio 0\|1` | 0 | 1 keeps the enemy team's radio voice lines audible |
 | `damagereport 0\|1\|show` | 1 | Round end damage report; `show` = now, with what's collected so far |
 | `spectarget 0\|1` | 1 | Demo UI's spectated player = POV player (also while dead) |
 | `chatlog 0\|1` | 0 | Log chat messages arriving at the chat HUD |
@@ -88,7 +90,8 @@ Tested in game on a Valve MM demo and a pro tournament demo.
 | Round end damage report | Working when played through; some inconsistencies after seeks |
 | Demo UI spectated player / markers | Working; some inconsistencies after seeks |
 | Chat | Working where readable (MM demo chat is encrypted) |
-| Grenade radio and kill reward chat lines | Working; chat sound not tested in game yet |
+| Grenade radio and kill reward chat lines | Working (incl. chat sound) |
+| Enemy radio voice muted | Working |
 | AWP/SSG scope blur | Broken (parked) |
 
 ## TODO / next steps
@@ -102,7 +105,7 @@ Missing / to fix:
       Could fill it by reading the demo's events ahead, or by noting the gap.
 - [ ] **Damage direction arcs, grenade / fire damage:** use the grenade or inferno position
       instead of the attacker's.
-- [ ] **Chat lines:** test the radio chat sound. Still missing: round end team
+- [ ] **Chat lines:** still missing: round end team
       income, bomb plant / defuse reward, radio commands (not in demos at all).
 - [ ] **Flash / HE ear ringing and HE screen shake.**
 - [ ] **AWP/SSG scope blur:** the local player's `m_vClientScopeInaccuracy` interpolation
