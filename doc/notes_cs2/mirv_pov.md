@@ -59,3 +59,49 @@ follow the POV player, also when seeking to a moment where they're dead.
 | `diag 0\|1` | 0 | Diagnostic log to console and `%TEMP%\mirv_pov_log.txt` |
 
 Technical background and findings: `mirv_pov_study.md`, `mirv_pov_spike.md`.
+
+## Status (CS2 1.41.9.1, 2026-10-19)
+
+Tested in game on a Valve MM demo and a pro tournament demo.
+
+| Feature | State |
+|---|---|
+| POV swap, direct switching, `mirv_pov 0` | Working |
+| Seeking (back and forward) | Working |
+| Player HUD, radar, killfeed, scoreboard | Working |
+| Player crosshair | Working for `CS-` codes; old `CSGO-` v1 codes fall back to yours |
+| Buy menu blur suppressed | Working |
+| Death camera, death card | Working |
+| Round end damage report | Working when played through; some inconsistencies after seeks |
+| Demo UI spectated player / markers | Working; some inconsistencies after seeks |
+| Chat | Working where readable (MM demo chat is encrypted) |
+| AWP/SSG scope blur | Broken (parked) |
+
+## TODO / next steps
+
+Missing / to fix:
+
+- [ ] **Seek inconsistencies.** The damage report and the demo UI spectated player sometimes
+      differ after seeks (seen in game, not narrowed down yet). Reproduce with `diag 1` and
+      `mirv_pov info`.
+- [ ] **Forward seeks:** the damage report misses events in the skipped part of a round.
+      Could fill it by reading the demo's events ahead, or by noting the gap.
+- [ ] **Damage-direction arcs** (`CCSUsrMsg_Damage` isn't in GOTV demos): rebuild from
+      `player_hurt` plus the attacker's position.
+- [ ] **Chat lines:** kill reward ("+$300"), radio texts.
+- [ ] **Flash / HE ear ringing and HE screen shake.**
+- [ ] **AWP/SSG scope blur:** the local player's `m_vClientScopeInaccuracy` interpolation
+      ignores the recording (see `mirv_pov_spike.md`).
+- [ ] **Old `CSGO-` v1 crosshair codes:** convert to the new format before applying.
+- [ ] **View angles:** use the recorded usercmd angles for a smoother first-person view.
+
+Polish / before upstreaming:
+
+- [ ] Robustness pass: map change and new demo while in POV, warmup, bots, disconnects,
+      players changing team, and every hook failing gracefully after a CS2 update.
+- [ ] Decide which `mirv_pov_debug` switches stay. Drop the purely diagnostic ones
+      (`hltvlog`, `chatlog`) or keep them hidden.
+- [ ] Clean up `mirv_pov_spike.md` into a maintainer-facing notes file (hook list,
+      signatures, what each one is for).
+- [ ] Discuss with advancedfx maintainers (issue / draft PR). The CMake Build Tools fix is
+      independent and could go as its own PR.

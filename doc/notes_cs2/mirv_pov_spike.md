@@ -1,6 +1,6 @@
 # CS2 mirv_pov spike: global local-player swap (approach B)
 
-Branch `spike/cs2-mirv-pov`. Code: `AfxHookSource2/MirvPovSpike.cpp`. Analysed on CS2 1.41.9.1
+Branch `cs2-mirv-pov`. Code: `AfxHookSource2/MirvPov.cpp` (was `MirvPovSpike.cpp` during the spike). Analysed on CS2 1.41.9.1
 (ClientVersion 2000933, 2026-10-15). RVAs are orientation only; the code finds everything
 by signature and reads offsets out of the matched instructions.
 
@@ -256,7 +256,7 @@ For 2 and 3, `GetSplitScreenPlayerPawn` is detoured and returns the target's
 notes) does the same in spirit: it calls the panel's Show directly and overrides the local
 pawn getter at the animation call site.
 
-### Round end damage report (under the avatars) — implemented, to be tested
+### Round end damage report (under the avatars) — working
 
 Two client paths exist, selected by the replicated dev convar `sv_dev_damage_use_netvars`
 (registered ~0xb46a0, default **true**, value byte +0x58 of the object at ~0x25358d8):
