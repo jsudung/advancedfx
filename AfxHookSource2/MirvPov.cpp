@@ -21,6 +21,8 @@ extern SOURCESDK::CS2::ISource2EngineToClient * g_pEngineToClient;
 #include <cstdint>
 #include <cstdio>
 #include <intrin.h>
+#include <algorithm>
+#include <vector>
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -135,6 +137,71 @@ unsigned char * g_pCrosshairHideFlag = nullptr;
 // The recorded C_CSPlayerPawn::m_bIsBuyMenuOpen makes the client blur the view (and hide
 // e.g. the radar) for the local player, without the menu itself. Clear it while swapped.
 bool g_PovSuppressBuyMenu = true;
+
+// Round end damage report (under the team counter avatars). The client builds it from the local
+// controller's CCSPlayerController_DamageServices::m_DamageList (CDamageRecord, 0x78 bytes each),
+// which isn't in GOTV demos. We collect the same numbers from player_hurt / player_death and when
+// the round is won (C_CSGameRules::m_iRoundWinStatus becomes non-0, there's no round_end event in
+// demos) run the native reporter on them, by pointing the target's list at our records meanwhile.
+typedef void (__fastcall * TeamCounter_DamageReport_t)(void * pTeamCounter);
+struct DamageReportAddrs_t {
+	TeamCounter_DamageReport_t Report = nullptr;
+	FindHudElement_t FindHudElement = nullptr;
+	void ** ppGameRules = nullptr;
+	unsigned char ** ppUseNetvarsCvar = nullptr; // sv_dev_damage_use_netvars (reporter only runs if true)
+	ptrdiff_t OfsCvarValue = 0;
+	ptrdiff_t OfsRoundWinStatus = 0;
+	ptrdiff_t OfsDamageServices = 0; // CCSPlayerController::m_pDamageServices
+	ptrdiff_t OfsListCount = 0; // m_DamageList size
+	ptrdiff_t OfsListMem = 0; // m_DamageList memory
+} g_DmgReport;
+bool g_PovDamageReport = true;
+
+// CDamageRecord fields the reporter reads:
+const int c_DmgRecordSize = 0x78;
+const int c_DmgRecordAttacker = 0x38; // controller handle
+const int c_DmgRecordVictim = 0x3c; // controller handle
+const int c_DmgRecordHealthRemoved = 0x68; // float, m_flActualHealthRemoved
+const int c_DmgRecordHits = 0x6c; // int
+const int c_DmgRecordKillType = 0x75; // byte, see DmgKillType_e
+// Index into the client's "HUD--killtype-*" table, 0 = not killed.
+enum DmgKillType_e { DmgKillType_None = 0, DmgKillType_Default, DmgKillType_Headshot, DmgKillType_Blast, DmgKillType_Burn, DmgKillType_Slash, DmgKillType_Shock };
+
+const int c_DmgMaxPlayers = 65; // controller entity indices 1..64
+// Every player_hurt / player_death seen, tagged with its round, so after seeking back into a
+// round that was played before the report is still complete. Replays are dropped by tick.
+struct DmgEvent_t {
+	int Tick;
+	int Round; // see DamageReport_GetRound
+	unsigned char Attacker; // controller entity index, 0 = none / world
+	unsigned char Victim;
+	bool Death;
+	unsigned char KillType;
+	int Health; // player_hurt: health left
+	int DmgHealth;
+};
+std::vector<DmgEvent_t> g_DmgEvents;
+struct DmgPair_t { float HealthRemoved; int Hits; unsigned char KillType; bool Used; };
+DmgPair_t g_DmgPairs[c_DmgMaxPlayers][c_DmgMaxPlayers]; // [attacker][victim], built from g_DmgEvents for one round
+const int c_DmgMaxRecords = 2 * c_DmgMaxPlayers;
+alignas(16) unsigned char g_DmgRecords[c_DmgMaxRecords][c_DmgRecordSize];
+int g_DmgLastWinStatus = -1; // -1 = unknown (after a reset, don't trigger on the first value)
+// The win status can arrive before the round's last player_death was fired, so wait a little:
+const int c_DmgPublishDelayFrames = 8;
+int g_DmgPublishInFrames = 0;
+int g_DmgLastResult = 0; // diagnostics, see DamageReport_Publish
+
+// Without C_CSGameRules::m_totalRoundsPlayed all events are round 0 and we clear at round start.
+bool DamageReport_HasRounds() {
+	return 0 != g_clientDllOffsets.C_CSGameRules.m_totalRoundsPlayed;
+}
+
+// Seeks: don't trigger on the win status we land on.
+void DamageReport_Reset(bool bClearEvents) {
+	if (bClearEvents || !DamageReport_HasRounds()) g_DmgEvents.clear();
+	g_DmgLastWinStatus = -1;
+	g_DmgPublishInFrames = 0;
+}
 
 struct EngineAddrs_t {
 	DemoPlayer_SkipToTick_t SkipToTick = nullptr; // trampoline after detouring
@@ -347,6 +414,7 @@ void KillCam_Apply(bool bVerbose) {
 }
 
 void * __fastcall New_DemoPlayer_SkipToTick(void * This, int nTick, unsigned int nFlags) {
+	DamageReport_Reset(false);
 	if (0 != g_KillCamTarget) {
 		// Same units as IDemoFile::GetDemoTick (flag 1 = relative). -2 = random tick, unknown target.
 		int targetTick = -1;
@@ -499,6 +567,188 @@ void ClearTargetPredictable() {
 	}
 }
 
+void DamageReport_AddRecord(int & count, uint32_t attacker, uint32_t victim, const DmgPair_t & pair) {
+	if (!pair.Used || c_DmgMaxRecords <= count) return;
+	unsigned char * pRecord = g_DmgRecords[count++];
+	memset(pRecord, 0, c_DmgRecordSize);
+	*(uint32_t *)(pRecord + c_DmgRecordAttacker) = attacker;
+	*(uint32_t *)(pRecord + c_DmgRecordVictim) = victim;
+	*(float *)(pRecord + c_DmgRecordHealthRemoved) = pair.HealthRemoved;
+	*(int *)(pRecord + c_DmgRecordHits) = pair.Hits;
+	pRecord[c_DmgRecordKillType] = pair.KillType;
+}
+
+// Records of everything between target and the others, like the server's list.
+int DamageReport_BuildRecords(int target) {
+	if (target < 1 || c_DmgMaxPlayers <= target) return 0;
+	CEntityInstance * pTarget = GetEntity(target);
+	if (nullptr == pTarget) return 0;
+	uint32_t targetHandle = (uint32_t)pTarget->GetHandle().ToInt();
+	int count = 0;
+	for (int other = 1; other < c_DmgMaxPlayers; ++other) {
+		if (other == target) continue;
+		CEntityInstance * pOther = GetEntity(other);
+		if (nullptr == pOther || !pOther->IsPlayerController()) continue;
+		uint32_t otherHandle = (uint32_t)pOther->GetHandle().ToInt();
+		DamageReport_AddRecord(count, targetHandle, otherHandle, g_DmgPairs[target][other]);
+		DamageReport_AddRecord(count, otherHandle, targetHandle, g_DmgPairs[other][target]);
+	}
+	return count;
+}
+
+// Must not contain objects with destructors (SEH).
+// Returns the record count, 0 = nothing to show, -1 = failed, -2 = the demo has the list itself.
+int DamageReport_CallReporter(void * pController, int count) {
+	__try {
+		void * pElement = g_DmgReport.FindHudElement("CCSGO_HudTeamCounter");
+		unsigned char * pServices = *(unsigned char **)((unsigned char *)pController + g_DmgReport.OfsDamageServices);
+		if (nullptr == pElement || nullptr == pServices) return -1;
+		int * pCount = (int *)(pServices + g_DmgReport.OfsListCount);
+		void ** ppMem = (void **)(pServices + g_DmgReport.OfsListMem);
+		if (0 < *pCount) return -2; // e.g. a POV demo: the game shows it by itself
+		int orgCount = *pCount;
+		void * pOrgMem = *ppMem;
+		*pCount = count;
+		*ppMem = g_DmgRecords;
+		__try {
+			g_DmgReport.Report((unsigned char *)pElement - 0x20);
+		}
+		__finally {
+			*pCount = orgCount;
+			*ppMem = pOrgMem;
+		}
+		return count;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return -1;
+	}
+}
+
+// Must not contain objects with destructors (SEH).
+bool DamageReport_GetRoundWinStatus(int & outStatus) {
+	__try {
+		unsigned char * pGameRules = (unsigned char *)*g_DmgReport.ppGameRules;
+		if (nullptr == pGameRules) return false;
+		outStatus = *(int *)(pGameRules + g_DmgReport.OfsRoundWinStatus);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+// Round an event belongs to: m_totalRoundsPlayed is incremented together with setting
+// m_iRoundWinStatus, so after the round was won it's one too high. -1 = unknown.
+// Must not contain objects with destructors (SEH).
+int DamageReport_GetRound() {
+	if (!DamageReport_HasRounds()) return 0;
+	__try {
+		unsigned char * pGameRules = (unsigned char *)*g_DmgReport.ppGameRules;
+		if (nullptr == pGameRules) return -1;
+		int played = *(int *)(pGameRules + g_clientDllOffsets.C_CSGameRules.m_totalRoundsPlayed);
+		int winStatus = *(int *)(pGameRules + g_DmgReport.OfsRoundWinStatus);
+		return 0 != winStatus ? played - 1 : played;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return -1;
+	}
+}
+
+bool DamageReport_IsValidPlayer(int index) { return 1 <= index && index < c_DmgMaxPlayers; }
+
+// Fills g_DmgPairs from the events of that round, in tick order.
+void DamageReport_BuildPairs(int round) {
+	memset(g_DmgPairs, 0, sizeof(g_DmgPairs));
+	std::vector<DmgEvent_t> events;
+	for (const DmgEvent_t & ev : g_DmgEvents) if (ev.Round == round) events.push_back(ev);
+	std::stable_sort(events.begin(), events.end(), [](const DmgEvent_t & a, const DmgEvent_t & b) { return a.Tick < b.Tick; });
+
+	int health[c_DmgMaxPlayers]; // to get the actual health removed (dmg_health isn't capped at what was left)
+	for (int i = 0; i < c_DmgMaxPlayers; ++i) health[i] = 100;
+
+	for (const DmgEvent_t & ev : events) {
+		int removed = 0;
+		if (ev.Death) health[ev.Victim] = 0;
+		else {
+			removed = ev.DmgHealth;
+			int fromHealth = health[ev.Victim] - ev.Health;
+			if (0 <= fromHealth && fromHealth < removed) removed = fromHealth;
+			if (removed < 0) removed = 0;
+			health[ev.Victim] = ev.Health;
+		}
+		if (!DamageReport_IsValidPlayer(ev.Attacker) || ev.Attacker == ev.Victim) continue;
+		DmgPair_t & pair = g_DmgPairs[ev.Attacker][ev.Victim];
+		if (ev.Death) pair.KillType = ev.KillType;
+		else if (0 < ev.DmgHealth) {
+			pair.HealthRemoved += (float)removed;
+			pair.Hits++;
+		} else continue;
+		pair.Used = true;
+	}
+}
+
+void DamageReport_Publish() {
+	g_DmgLastResult = 0;
+	if (nullptr == g_DmgReport.Report || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames) return;
+	int round = DamageReport_GetRound();
+	if (round < 0) return;
+	DamageReport_BuildPairs(round);
+	int count = DamageReport_BuildRecords(g_KillCamTarget);
+	g_DmgLastResult = 0 < count ? DamageReport_CallReporter(g_KillCamLastSwapped, count) : 0;
+	if (-1 == g_DmgLastResult) advancedfx::Warning("mirv_pov: showing the round end damage report failed.\n");
+	else DiagLog("mirv_pov: round end damage report for %i, round %i: %i\n", g_KillCamTarget, round, g_DmgLastResult);
+}
+
+// Once per rendered frame (not while suspended).
+void DamageReport_OnFrame() {
+	if (nullptr == g_DmgReport.Report) return;
+	int status = 0;
+	if (!DamageReport_GetRoundWinStatus(status)) return;
+	if (g_DmgLastWinStatus < 0) {
+		g_DmgLastWinStatus = status;
+	} else if (status != g_DmgLastWinStatus) {
+		if (0 == g_DmgLastWinStatus) g_DmgPublishInFrames = c_DmgPublishDelayFrames; // round won
+		else if (0 == status) { // next round
+			if (!DamageReport_HasRounds()) g_DmgEvents.clear();
+			g_DmgPublishInFrames = 0;
+		}
+		g_DmgLastWinStatus = status;
+	}
+	if (0 < g_DmgPublishInFrames && 0 == --g_DmgPublishInFrames && g_PovDamageReport) DamageReport_Publish();
+}
+
+unsigned char DamageReport_KillType(const char * pszWeapon, bool bHeadshot) {
+	if (nullptr != pszWeapon) {
+		if (0 == strncmp(pszWeapon, "weapon_", 7)) pszWeapon += 7;
+		if (0 == strcmp(pszWeapon, "hegrenade") || 0 == strcmp(pszWeapon, "planted_c4")) return DmgKillType_Blast;
+		if (0 == strcmp(pszWeapon, "inferno") || 0 == strcmp(pszWeapon, "molotov") || 0 == strcmp(pszWeapon, "incgrenade")) return DmgKillType_Burn;
+		if (0 == strncmp(pszWeapon, "knife", 5) || 0 == strncmp(pszWeapon, "bayonet", 7)) return DmgKillType_Slash;
+		if (0 == strcmp(pszWeapon, "taser")) return DmgKillType_Shock;
+	}
+	return bHeadshot ? DmgKillType_Headshot : DmgKillType_Default;
+}
+
+void DamageReport_AddEvent(int attacker, int victim, bool bDeath, unsigned char killType, int health, int dmgHealth) {
+	if (!DamageReport_IsValidPlayer(victim)) return;
+	DmgEvent_t ev;
+	ev.Tick = GetDemoTick();
+	ev.Round = DamageReport_GetRound();
+	ev.Attacker = (unsigned char)(DamageReport_IsValidPlayer(attacker) ? attacker : 0);
+	ev.Victim = (unsigned char)victim;
+	ev.Death = bDeath;
+	ev.KillType = killType;
+	ev.Health = health;
+	ev.DmgHealth = dmgHealth;
+	if (ev.Round < 0) return;
+	if (0 <= ev.Tick) {
+		for (const DmgEvent_t & o : g_DmgEvents) {
+			if (o.Tick == ev.Tick && o.Attacker == ev.Attacker && o.Victim == ev.Victim && o.Death == ev.Death
+				&& o.Health == ev.Health && o.DmgHealth == ev.DmgHealth) return; // played again after seeking back
+		}
+	}
+	g_DmgEvents.push_back(ev);
+}
+
 // Must not contain objects with destructors (SEH).
 bool ApplyTargetCrosshair(void * pSettings) {
 	__try {
@@ -604,6 +854,18 @@ void PrintInfo() {
 		(unsigned long long)g_clientDllOffsets.C_CSPlayerPawn.m_bIsBuyMenuOpen,
 		nullptr != g_Client.ScoreboardHltvJe ? "OK" : "MISSING", g_Client.ScoreboardPatched ? 1 : 0,
 		nullptr != g_Org_HudChat_SayText2 ? "OK" : "MISSING");
+
+	{
+		int winStatus = -1;
+		int useNetvars = -1;
+		if (nullptr != g_DmgReport.Report) {
+			DamageReport_GetRoundWinStatus(winStatus);
+			if (nullptr != *g_DmgReport.ppUseNetvarsCvar) useNetvars = *(*g_DmgReport.ppUseNetvarsCvar + g_DmgReport.OfsCvarValue) ? 1 : 0;
+		}
+		InfoPrintf("Damage report: hook %s, on %i, sv_dev_damage_use_netvars %i, round win status %i, round %i, events %i, last result %i\n",
+			nullptr != g_DmgReport.Report ? "OK" : "MISSING", g_PovDamageReport ? 1 : 0, useNetvars, winStatus,
+			nullptr != g_DmgReport.Report ? DamageReport_GetRound() : -1, (int)g_DmgEvents.size(), g_DmgLastResult);
+	}
 
 	if (!g_Client.Ok) return;
 
@@ -801,6 +1063,38 @@ void MirvPov_HookClientDll(HMODULE clientDll) {
 		} else advancedfx::Warning("mirv_pov: crosshair HUD site not found.\n");
 	}
 
+	// Damage list change callback (CCSPlayerController_DamageServices::m_nSendUpdate):
+	//   if (sv_dev_damage_use_netvars && changed && g_pGameRules && g_pGameRules->m_iRoundWinStatus)
+	//     jmp DamageReport(FindHudElement("CCSGO_HudTeamCounter") - 0x20)
+	// DamageReport: ... mov r12, [r13+m_pDamageServices] (+0x7c); cmp [r12+size], eax (+0x94);
+	//   imul rbp, rax, 78h (+0xa3); add rbp, [r12+memory] (+0xa7)
+	{
+		Afx::BinUtils::MemRange cbResult = Afx::BinUtils::FindPatternString(textRange,
+			"48 83 EC 28 48 8B 05 ?? ?? ?? ?? 80 78 ?? 00 74 ?? 41 8B 00 39 41 ?? 74 ?? 89 41 ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? "
+			"83 B8 ?? ?? ?? ?? 00 74 ?? 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 33 D2 48 85 C0 48 8D 48 E0 48 0F 44 CA 48 83 C4 28 E9");
+		if (!cbResult.IsEmpty()) {
+			size_t cb = cbResult.Start;
+			size_t report = cb + 0x4e + 5 + ReadRel32(cb + 0x4f);
+			static const unsigned char movServices[] = { 0x4D, 0x8B, 0xA5 };
+			static const unsigned char cmpSize[] = { 0x41, 0x39, 0x44, 0x24 };
+			static const unsigned char imulStride[] = { 0x48, 0x6B, 0xE8, (unsigned char)c_DmgRecordSize };
+			static const unsigned char addMemory[] = { 0x49, 0x03, 0x6C, 0x24 };
+			if (BytesEqual(report + 0x7c, movServices, sizeof(movServices)) && BytesEqual(report + 0x94, cmpSize, sizeof(cmpSize))
+				&& BytesEqual(report + 0xa3, imulStride, sizeof(imulStride)) && BytesEqual(report + 0xa7, addMemory, sizeof(addMemory))) {
+				g_DmgReport.ppUseNetvarsCvar = (unsigned char **)(cb + 0x04 + 7 + ReadRel32(cb + 0x07));
+				g_DmgReport.OfsCvarValue = *(unsigned char *)(cb + 0x0d);
+				g_DmgReport.ppGameRules = (void **)(cb + 0x1c + 7 + ReadRel32(cb + 0x1f));
+				g_DmgReport.OfsRoundWinStatus = ReadRel32(cb + 0x2a);
+				g_DmgReport.FindHudElement = (FindHudElement_t)(cb + 0x38 + 5 + ReadRel32(cb + 0x39));
+				g_DmgReport.OfsDamageServices = ReadRel32(report + 0x7f);
+				g_DmgReport.OfsListCount = *(unsigned char *)(report + 0x98);
+				g_DmgReport.OfsListMem = *(unsigned char *)(report + 0xab);
+				g_DmgReport.Report = (TeamCounter_DamageReport_t)report;
+				DamageReport_Reset(true);
+			} else advancedfx::Warning("mirv_pov: damage reporter layout changed (no round end damage report).\n");
+		} else advancedfx::Warning("mirv_pov: damage list callback not found (no round end damage report).\n");
+	}
+
 	// See comment on top.
 	Afx::BinUtils::MemRange result = Afx::BinUtils::FindPatternString(textRange,
 		"40 55 53 57 41 56 41 57 48 8B EC 48 81 EC ?? ?? ?? ?? 48 63 FA 4C 8B F1 41 BF FF FF FF FF 83 FF FF ?? ?? "
@@ -882,6 +1176,7 @@ void MirvPov_BeforeFrameStageNotify(int curStage) {
 	}
 	KillCam_Apply(false);
 	if (g_PovSuppressBuyMenu && nullptr != g_KillCamLastSwapped) SuppressTargetBuyMenu();
+	if (SOURCESDK::CS2::FRAME_RENDER_PASS == curStage) DamageReport_OnFrame();
 
 	// After a (re-)swap: undo the predictability the game just gave the target's entities.
 	static void * s_pPredictClearedFor = nullptr;
@@ -909,6 +1204,63 @@ static void * GetGameEventPlayerController(SOURCESDK::CS2::IGameEvent * pEvent, 
 }
 
 // Must not contain objects with destructors (SEH).
+static int GetGameEventInt(SOURCESDK::CS2::IGameEvent * pEvent, const char * pszKey) {
+	if (nullptr == g_Original_hashString) return 0;
+	__try {
+		unsigned int len = (unsigned int)strlen(pszKey);
+		SOURCESDK::CS2::CKV3MemberName key((int)g_Original_hashString(pszKey, len, len ^ 0x31415926), -1, pszKey);
+		return pEvent->GetInt(key);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0;
+	}
+}
+
+// Must not contain objects with destructors (SEH).
+static bool GetGameEventBool(SOURCESDK::CS2::IGameEvent * pEvent, const char * pszKey) {
+	if (nullptr == g_Original_hashString) return false;
+	__try {
+		unsigned int len = (unsigned int)strlen(pszKey);
+		SOURCESDK::CS2::CKV3MemberName key((int)g_Original_hashString(pszKey, len, len ^ 0x31415926), -1, pszKey);
+		return pEvent->GetBool(key);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+// Must not contain objects with destructors (SEH). Only valid while the event is.
+static const char * GetGameEventString(SOURCESDK::CS2::IGameEvent * pEvent, const char * pszKey) {
+	if (nullptr == g_Original_hashString) return nullptr;
+	__try {
+		unsigned int len = (unsigned int)strlen(pszKey);
+		SOURCESDK::CS2::CKV3MemberName key((int)g_Original_hashString(pszKey, len, len ^ 0x31415926), -1, pszKey);
+		return pEvent->GetString(key);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return nullptr;
+	}
+}
+
+// Collected all the time (not only while swapped), so switching players mid round works.
+static void DamageReport_OnGameEvent(SOURCESDK::CS2::IGameEvent * pEvent, const char * pszName) {
+	if (nullptr == g_DmgReport.Report) return;
+	if (0 == strcmp(pszName, "begin_new_match")) {
+		// Warmup has the same m_totalRoundsPlayed (0) as the first round.
+		int tick = GetDemoTick();
+		g_DmgEvents.erase(std::remove_if(g_DmgEvents.begin(), g_DmgEvents.end(),
+			[tick](const DmgEvent_t & ev) { return ev.Tick < 0 || ev.Tick <= tick; }), g_DmgEvents.end());
+		return;
+	}
+	bool bHurt = 0 == strcmp(pszName, "player_hurt");
+	if (!bHurt && 0 != strcmp(pszName, "player_death")) return;
+	int victim = GetEntityIndex(GetGameEventPlayerController(pEvent, "userid"));
+	int attacker = GetEntityIndex(GetGameEventPlayerController(pEvent, "attacker"));
+	if (bHurt) DamageReport_AddEvent(attacker, victim, false, DmgKillType_None, GetGameEventInt(pEvent, "health"), GetGameEventInt(pEvent, "dmg_health"));
+	else DamageReport_AddEvent(attacker, victim, true, DamageReport_KillType(GetGameEventString(pEvent, "weapon"), GetGameEventBool(pEvent, "headshot")), 0, 0);
+}
+
+// Must not contain objects with destructors (SEH).
 static bool ShowDeathCard() {
 	__try {
 		void * pElement = g_FindHudElement("CCSGO_HudDeathPanel");
@@ -923,11 +1275,16 @@ static bool ShowDeathCard() {
 
 // Returns true if this is a player_death of the swapped target. Must not keep pEvent.
 bool MirvPov_BeforeClientGameEvent(SOURCESDK::CS2::IGameEvent * pEvent) {
-	if (!g_PovDeathCard || nullptr == pEvent || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames
+	if (nullptr == pEvent) return false;
+	const char * pszName = pEvent->GetName();
+	if (nullptr == pszName) return false;
+
+	DamageReport_OnGameEvent(pEvent, pszName);
+
+	if (!g_PovDeathCard || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames
 		|| nullptr == g_FindHudElement || nullptr == g_DeathPanel_SetPendingDamage) return false;
 
-	const char * pszName = pEvent->GetName();
-	if (nullptr == pszName || 0 != strcmp(pszName, "player_death")) return false;
+	if (0 != strcmp(pszName, "player_death")) return false;
 
 	return GetGameEventPlayerController(pEvent, "userid") == g_KillCamLastSwapped;
 }
@@ -942,6 +1299,7 @@ void MirvPov_AfterClientGameEvent(bool bBeforeResult) {
 void MirvPov_OnLevelInitPreEntity() {
 	// Entities are already gone here, so don't call into the game, only reset the override:
 	KillCam_Suspend("level load", false, c_KillCamResumeDelayFrames);
+	DamageReport_Reset(true);
 }
 
 static void MirvPov_Info() {
@@ -1073,6 +1431,21 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 			return;
 		}
 
+		if (0 == _stricmp(cmd, "damagereport") && 3 <= argc) {
+			if (nullptr == g_DmgReport.Report) {
+				advancedfx::Warning("mirv_pov: damage report hook not installed.\n");
+				return;
+			}
+			if (0 == _stricmp(args->ArgV(2), "show")) {
+				DamageReport_Publish();
+				advancedfx::Message("mirv_pov: damage report result %i (records, 0 = nothing collected / not in POV, -1 = failed, -2 = demo has its own).\n", g_DmgLastResult);
+				return;
+			}
+			g_PovDamageReport = 0 != atoi(args->ArgV(2));
+			advancedfx::Message("mirv_pov: round end damage report %s.\n", g_PovDamageReport ? "on" : "off");
+			return;
+		}
+
 		if (0 == _stricmp(cmd, "chatlog") && 3 <= argc) {
 			if (nullptr == g_Org_HudChat_SayText2) {
 				advancedfx::Warning("mirv_pov: chat hook not installed.\n");
@@ -1105,9 +1478,10 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s buymenu <0|1> - 1 keeps the recorded buy menu state (view gets blurred), 0 suppresses it (default 0).\n"
 		"%s predict <0|1> - 0 keeps the player's pawn / weapons non-predicted (default), 1 = game default.\n"
 		"%s deathcard <0|1> - Show the \"killed you with\" death card (default 1).\n"
+		"%s damagereport <0|1|show> - Round end damage report under the avatars (default 1), show = now, with what's collected so far.\n"
 		"%s chatlog <0|1> - Log chat (SayText2) messages arriving at the chat HUD.\n"
 		"%s hltvlog [0|1] - IsHLTV() caller logging on (resets) / off, without argument prints the callers.\n"
 		"%s diag <0|1> - Diagnostic logging to console and %%TEMP%%\\mirv_pov_log.txt (default 0).\n"
-		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
+		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
 	);
 }

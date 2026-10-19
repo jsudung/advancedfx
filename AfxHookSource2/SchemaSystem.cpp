@@ -119,7 +119,8 @@ void initSchemaSystemOffsets()
 
 	if (!bOk) ErrorBox(MkErrStr(__FILE__, __LINE__));
 
-	// Optional (experimental mirv_pov_spike), no error if missing:
+	// Optional (mirv_pov), no error if missing:
+	getOffset(&g_clientDllOffsets.C_CSGameRules.m_totalRoundsPlayed, "client.dll", "C_CSGameRules", "m_totalRoundsPlayed");
 	getOffset(&g_clientDllOffsets.CBasePlayerController.m_bIsLocalPlayerController, "client.dll", "CBasePlayerController", "m_bIsLocalPlayerController");
 	getOffset(&g_clientDllOffsets.C_CSPlayerPawn.m_bIsBuyMenuOpen, "client.dll", "C_CSPlayerPawn", "m_bIsBuyMenuOpen");
 	getOffset(&g_clientDllOffsets.CCSPlayerController.m_szCrosshairCodes, "client.dll", "CCSPlayerController", "m_szCrosshairCodes");

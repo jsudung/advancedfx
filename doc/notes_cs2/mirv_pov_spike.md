@@ -256,6 +256,60 @@ For 2 and 3, `GetSplitScreenPlayerPawn` is detoured and returns the target's
 notes) does the same in spirit: it calls the panel's Show directly and overrides the local
 pawn getter at the animation call site.
 
+### Round end damage report (under the avatars) — implemented, to be tested
+
+Two client paths exist, selected by the replicated dev convar `sv_dev_damage_use_netvars`
+(registered ~0xb46a0, default **true**, value byte +0x58 of the object at ~0x25358d8):
+
+- **Legacy (convar false):** `CCSUsrMsg_PostRoundDamageReport` → `CCSGO_HudTeamCounter`
+  handler (~0xec9e90), one message per other player, matched by xuid. Not in demos.
+- **Netvars (convar true, current default):** the change callback of
+  `CCSPlayerController_DamageServices::m_nSendUpdate` (~0x910890) runs
+  `if (cvar && changed && g_pGameRules && g_pGameRules->m_iRoundWinStatus (+0x9ac))` and tail jumps to
+  the TeamCounter reporter (~0xebd170, arg `FindHudElement("CCSGO_HudTeamCounter") - 0x20`).
+  The reporter takes the local controller (`GetSplitScreenPlayer(0)`, so the swapped
+  target), needs team 2/3 (+0x3e7), clears the rows (~0xec1f70), then walks
+  `m_pDamageServices` (+0x830) → `m_DamageList` (size +0x48, memory +0x50, 0x78-byte
+  `CDamageRecord`s). It reads attacker / victim controller handles at +0x38 / +0x3c,
+  `m_flActualHealthRemoved` float +0x68, hits +0x6c and kill type byte +0x75. For each record
+  touching the local controller, it fills the matching avatar row (20 rows at +0xf0, stride
+  0xe0, panel at +0x10) via ~0xecd690 (`health_removed`/`num_hits` or `return_*`,
+  `kill-type-given/taken`). Then it sets `order_index` and dispatches the reveal event for
+  each filled row. Kill type indexes `HUD--killtype-*`: 0 none, 1 default, 2 headshot,
+  3 blast, 4 burn, 5 slash, 6 shock.
+
+In GOTV demos the damage list is empty (owner-only). Neither test demo has a `round_end`
+game event, and the pro demo doesn't have `round_prestart` either (only `round_freeze_end`,
+`round_officially_ended` in MM). So:
+
+- Pairs (attacker → victim controller) are collected from `player_hurt` and
+  `player_death` all the time, not only while swapped:
+  - Health removed is `dmg_health`, capped by the drop in the victim's `health`.
+  - Every hurt event counts as a hit.
+  - The kill type comes from `weapon` / `headshot`.
+- Round end = `m_iRoundWinStatus` going 0 → non-0, polled each rendered frame. After 8
+  frames (so the round's last `player_death` has arrived) the target's `m_DamageList` is
+  pointed at our records, the reporter is called, and the list is restored. If the list is
+  non-empty, nothing is done (e.g. POV demos, where the game shows the report by itself).
+- Events are kept for the whole demo, tagged with the round:
+  - The round key is `m_totalRoundsPlayed`, minus 1 while `m_iRoundWinStatus != 0`.
+    Both are set together when a round ends, so post-round damage stays in its round.
+  - Replays after seeking back are dropped by (tick, attacker, victim, health, damage).
+  - At publish, the round's events are sorted by tick and actual health removed is
+    recomputed from 100.
+  - On `begin_new_match`, events up to that tick are dropped, because warmup has the same
+    round number (0) as round 1.
+  - The log is cleared on level load.
+  - Seeks only reset the win status tracking, so the round end we land on doesn't trigger.
+  - Without the schema offset this falls back to clearing per round and on seeks.
+- First in-game version (cleared on every seek) worked when playing straight through. When
+  the user sought back into a round where the POV player was already dead, nothing was
+  shown, because the events from before the seek point weren't replayed.
+
+The GOTV layout's `.TeamCounter__Align--Bottom .prdr__root { visibility: collapse; }` (per
+the fork's notes) could still hide it; with the IsHLTV spoof the player layout should be
+used.
+
 ## Packaged as mirv_pov
 
 The spike was packaged as `mirv_pov <idx> | 0 | list | info` (code: `AfxHookSource2/MirvPov.*`),

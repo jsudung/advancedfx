@@ -26,6 +26,10 @@ back by itself a few frames later. The demo UI's kill/death markers follow the P
 - The player's own crosshair (new-format `CS...` crosshair codes).
 - No buy-menu blur when the player opens their buy menu.
 - Death camera and the "killed you with ..." death card.
+- Round end damage report under the avatars (damage / hits given and taken, kill type). It's
+  rebuilt from the demo's hurt and death events as they play. Seeking back into a round
+  you've already watched is fine. If you skip part of a round by seeking forward, the report
+  misses what you skipped.
 - Chat, if the demo contains readable chat.
 
 ## Known limitations
@@ -36,7 +40,7 @@ back by itself a few frames later. The demo UI's kill/death markers follow the P
 - **Chat in Valve matchmaking demos** is encrypted. Global chat only shows when watched via the
   in-game Watch UI, and team chat never does.
 - **Not recorded in GOTV demos, so not shown:** damage-direction arcs, flash/HE ringing, HE
-  screen shake, radio texts and kill-reward ("+$300") chat lines, the round-end damage report.
+  screen shake, radio texts and kill-reward ("+$300") chat lines.
 
 ## Advanced switches (`mirv_pov_debug`)
 
@@ -47,6 +51,7 @@ back by itself a few frames later. The demo UI's kill/death markers follow the P
 | `buymenu 0\|1` | 0 | 1 keeps the recorded buy menu state (blurred view) |
 | `predict 0\|1` | 0 | 1 lets the game predict the player's pawn (game default) |
 | `deathcard 0\|1` | 1 | Show the death card |
+| `damagereport 0\|1\|show` | 1 | Round end damage report; `show` = now, with what's collected so far |
 | `chatlog 0\|1` | 0 | Log chat messages arriving at the chat HUD |
 | `hltvlog [0\|1]` | 0 | Log which client code asks IsHLTV() |
 | `diag 0\|1` | 0 | Diagnostic log to console and `%TEMP%\mirv_pov_log.txt` |
