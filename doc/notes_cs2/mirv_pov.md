@@ -17,7 +17,8 @@ mirv_pov info        // status / diagnostics, also written to %TEMP%\mirv_pov_in
 ```
 
 Seeking (demo UI slider or `demo_gototick`) works: POV pauses during the seek and comes
-back by itself a few frames later. The demo UI's kill/death markers follow the POV player.
+back by itself a few frames later. The demo UI's spectated player and kill/death markers
+follow the POV player, also when seeking to a moment where they're dead.
 
 ## What works
 
@@ -52,6 +53,7 @@ back by itself a few frames later. The demo UI's kill/death markers follow the P
 | `predict 0\|1` | 0 | 1 lets the game predict the player's pawn (game default) |
 | `deathcard 0\|1` | 1 | Show the death card |
 | `damagereport 0\|1\|show` | 1 | Round end damage report; `show` = now, with what's collected so far |
+| `spectarget 0\|1` | 1 | Demo UI's spectated player = POV player (also while dead) |
 | `chatlog 0\|1` | 0 | Log chat messages arriving at the chat HUD |
 | `hltvlog [0\|1]` | 0 | Log which client code asks IsHLTV() |
 | `diag 0\|1` | 0 | Diagnostic log to console and `%TEMP%\mirv_pov_log.txt` |

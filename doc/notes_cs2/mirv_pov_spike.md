@@ -310,6 +310,20 @@ The GOTV layout's `.TeamCounter__Align--Bottom .prdr__root { visibility: collaps
 the fork's notes) could still hide it; with the IsHLTV spoof the player layout should be
 used.
 
+### Demo UI spectated player after seeks
+
+After a seek the swap pauses and `spec_player <target>` is sent each frame, so the demo UI
+(spectated player name, kill / death markers) follows the target. A dead player can't be
+spectated, though. Seeking to a moment where the target was dead left the GOTV observer on
+another player, and the demo UI showed that name (seen in game: a player on the other team).
+
+The demo UI takes it from the client-side game event `spec_target_updated`, fired by
+`CCSObserver_ObserverServices` (sender ~0xa70cc0: `SetPlayer("userid", pawn)` via
+event vtable +0xe8, `SetEntity("target", GetObserverTarget())` via +0xd0). We hook
+`FireEventClientSide` anyway, so while a target is set the event's `target` is overwritten
+with the target's `m_hPlayerPawn` entity (it exists while dead) before the listeners run.
+The vtable index is read from the sender (`mov rdi, [rcx+disp]` at +0xbf).
+
 ## Packaged as mirv_pov
 
 The spike was packaged as `mirv_pov <idx> | 0 | list | info` (code: `AfxHookSource2/MirvPov.*`),

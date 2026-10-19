@@ -203,6 +203,14 @@ void DamageReport_Reset(bool bClearEvents) {
 	g_DmgPublishInFrames = 0;
 }
 
+// demo UI spec target: the client fires "spec_target_updated" with the (real, GOTV) local player's
+// observer target. After a seek we spec_player the target, but a dead player can't be spectated, so
+// the demo UI shows (and puts markers for) someone else. We set the event's "target" to the
+// target's pawn instead, with IGameEvent::SetEntity (vtable index taken from the client's sender).
+typedef void (__fastcall * GameEvent_SetEntity_t)(void * pEvent, const SOURCESDK::CS2::CKV3MemberName * pKey, void * pEntity);
+int g_GameEventSetEntityIndex = -1;
+bool g_PovSpecTarget = true;
+
 struct EngineAddrs_t {
 	DemoPlayer_SkipToTick_t SkipToTick = nullptr; // trampoline after detouring
 	EngineClient_IsHLTV_t IsHLTV = nullptr; // trampoline after detouring
@@ -862,9 +870,10 @@ void PrintInfo() {
 			DamageReport_GetRoundWinStatus(winStatus);
 			if (nullptr != *g_DmgReport.ppUseNetvarsCvar) useNetvars = *(*g_DmgReport.ppUseNetvarsCvar + g_DmgReport.OfsCvarValue) ? 1 : 0;
 		}
-		InfoPrintf("Damage report: hook %s, on %i, sv_dev_damage_use_netvars %i, round win status %i, round %i, events %i, last result %i\n",
+		InfoPrintf("Damage report: hook %s, on %i, sv_dev_damage_use_netvars %i, round win status %i, round %i, events %i, last result %i | spec target fix: %s, on %i\n",
 			nullptr != g_DmgReport.Report ? "OK" : "MISSING", g_PovDamageReport ? 1 : 0, useNetvars, winStatus,
-			nullptr != g_DmgReport.Report ? DamageReport_GetRound() : -1, (int)g_DmgEvents.size(), g_DmgLastResult);
+			nullptr != g_DmgReport.Report ? DamageReport_GetRound() : -1, (int)g_DmgEvents.size(), g_DmgLastResult,
+			0 <= g_GameEventSetEntityIndex ? "OK" : "MISSING", g_PovSpecTarget ? 1 : 0);
 	}
 
 	if (!g_Client.Ok) return;
@@ -1095,6 +1104,19 @@ void MirvPov_HookClientDll(HMODULE clientDll) {
 		} else advancedfx::Warning("mirv_pov: damage list callback not found (no round end damage report).\n");
 	}
 
+	// "spec_target_updated" sender (CCSObserver_ObserverServices): event = CreateEvent(..); SetPlayer("userid", pawn);
+	// mov rdi, [rcx+SetEntity] (+0xbf); ...; SetEntity("target", GetObserverTarget())
+	{
+		Afx::BinUtils::MemRange specResult = Afx::BinUtils::FindPatternString(textRange,
+			"48 89 5C 24 18 56 48 83 EC 30 48 8B D9 48 8D 15 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? 45 33 C9 45 33 C0 48 8B 01 FF 50 30 48 8B F0 48 85 C0");
+		static const unsigned char movRdi[] = { 0x48, 0x8B, 0xB9 };
+		if (!specResult.IsEmpty()
+			&& 0 == strcmp((const char *)(specResult.Start + 0x0d + 7 + ReadRel32(specResult.Start + 0x10)), "spec_target_updated")
+			&& BytesEqual(specResult.Start + 0xbf, movRdi, sizeof(movRdi)) && 0 == ReadRel32(specResult.Start + 0xc2) % 8) {
+			g_GameEventSetEntityIndex = ReadRel32(specResult.Start + 0xc2) / 8;
+		} else advancedfx::Warning("mirv_pov: spec_target_updated sender not found (demo UI may show another spectated player after seeks).\n");
+	}
+
 	// See comment on top.
 	Afx::BinUtils::MemRange result = Afx::BinUtils::FindPatternString(textRange,
 		"40 55 53 57 41 56 41 57 48 8B EC 48 81 EC ?? ?? ?? ?? 48 63 FA 4C 8B F1 41 BF FF FF FF FF 83 FF FF ?? ?? "
@@ -1260,6 +1282,41 @@ static void DamageReport_OnGameEvent(SOURCESDK::CS2::IGameEvent * pEvent, const 
 	else DamageReport_AddEvent(attacker, victim, true, DamageReport_KillType(GetGameEventString(pEvent, "weapon"), GetGameEventBool(pEvent, "headshot")), 0, 0);
 }
 
+// The target's player pawn, also while dead (unlike GetSwappedTargetPlayerPawn).
+// Must not contain objects with destructors (SEH).
+static void * GetTargetPlayerPawn(int target) {
+	if (0 == g_clientDllOffsets.CCSPlayerController.m_hPlayerPawn || target < 1) return nullptr;
+	__try {
+		CEntityInstance * pController = GetEntity(target);
+		if (nullptr == pController || !pController->IsPlayerController()) return nullptr;
+		SOURCESDK::CS2::CBaseHandle handle(*(uint32_t *)((unsigned char *)pController + g_clientDllOffsets.CCSPlayerController.m_hPlayerPawn));
+		int index = handle.GetEntryIndex();
+		if (index < 0) return nullptr;
+		CEntityInstance * pPawn = GetEntity(index);
+		return nullptr != pPawn && pPawn->IsPlayerPawn() ? pPawn : nullptr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return nullptr;
+	}
+}
+
+// Must not contain objects with destructors (SEH).
+static void FixSpecTargetEvent(SOURCESDK::CS2::IGameEvent * pEvent) {
+	if (!g_PovSpecTarget || 0 == g_KillCamTarget || g_GameEventSetEntityIndex < 0 || nullptr == g_Original_hashString) return;
+	void * pPawn = GetTargetPlayerPawn(g_KillCamTarget);
+	if (nullptr == pPawn) return;
+	__try {
+		const char * pszKey = "target";
+		unsigned int len = (unsigned int)strlen(pszKey);
+		SOURCESDK::CS2::CKV3MemberName key((int)g_Original_hashString(pszKey, len, len ^ 0x31415926), -1, pszKey);
+		GameEvent_SetEntity_t setEntity = (GameEvent_SetEntity_t)(*(void ***)pEvent)[g_GameEventSetEntityIndex];
+		setEntity(pEvent, &key, pPawn);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		g_GameEventSetEntityIndex = -1;
+	}
+}
+
 // Must not contain objects with destructors (SEH).
 static bool ShowDeathCard() {
 	__try {
@@ -1280,6 +1337,11 @@ bool MirvPov_BeforeClientGameEvent(SOURCESDK::CS2::IGameEvent * pEvent) {
 	if (nullptr == pszName) return false;
 
 	DamageReport_OnGameEvent(pEvent, pszName);
+
+	if (0 == strcmp(pszName, "spec_target_updated")) {
+		FixSpecTargetEvent(pEvent);
+		return false;
+	}
 
 	if (!g_PovDeathCard || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames
 		|| nullptr == g_FindHudElement || nullptr == g_DeathPanel_SetPendingDamage) return false;
@@ -1446,6 +1508,16 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 			return;
 		}
 
+		if (0 == _stricmp(cmd, "spectarget") && 3 <= argc) {
+			if (g_GameEventSetEntityIndex < 0) {
+				advancedfx::Warning("mirv_pov: spec target fix not available.\n");
+				return;
+			}
+			g_PovSpecTarget = 0 != atoi(args->ArgV(2));
+			advancedfx::Message("mirv_pov: demo UI spec target fix %s.\n", g_PovSpecTarget ? "on" : "off");
+			return;
+		}
+
 		if (0 == _stricmp(cmd, "chatlog") && 3 <= argc) {
 			if (nullptr == g_Org_HudChat_SayText2) {
 				advancedfx::Warning("mirv_pov: chat hook not installed.\n");
@@ -1479,9 +1551,10 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s predict <0|1> - 0 keeps the player's pawn / weapons non-predicted (default), 1 = game default.\n"
 		"%s deathcard <0|1> - Show the \"killed you with\" death card (default 1).\n"
 		"%s damagereport <0|1|show> - Round end damage report under the avatars (default 1), show = now, with what's collected so far.\n"
+		"%s spectarget <0|1> - Make the demo UI's spectated player (and its markers) the POV player, also while dead (default 1).\n"
 		"%s chatlog <0|1> - Log chat (SayText2) messages arriving at the chat HUD.\n"
 		"%s hltvlog [0|1] - IsHLTV() caller logging on (resets) / off, without argument prints the callers.\n"
 		"%s diag <0|1> - Diagnostic logging to console and %%TEMP%%\\mirv_pov_log.txt (default 0).\n"
-		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
+		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
 	);
 }
