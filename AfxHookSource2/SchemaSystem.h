@@ -28,6 +28,7 @@ struct ClientDllOffsets_t {
 		ptrdiff_t m_iHealth = 0; // int32
 		ptrdiff_t m_iTeamNum = 0; // uint8
 		ptrdiff_t m_hOwnerEntity = 0; // CHandle<C_BaseEntity>
+		ptrdiff_t m_fFlags = 0; // uint32, optional (0 if not found)
 	} C_BaseEntity;
 
 	struct C_BaseModelEntity {

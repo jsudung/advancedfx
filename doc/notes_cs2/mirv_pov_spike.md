@@ -415,6 +415,55 @@ Fix: the spectator tools check is detoured to return false whenever a POV target
 while paused). `mirv_pov 0` invalidates the spec target cache once more, so the refresh brings
 x-ray back for normal spectating. `mirv_pov info` prints the check's inputs.
 
+### Ear ringing and C4 screen shake
+
+Both are sent by the server to single players, so they aren't in GOTV demos (read from
+server.dll):
+
+- **Flashbang deafen** (~0x21f540, called only from the flashbang detonation, right after
+  `player_blind` for each blinded player). The argument is the distance between the flash and
+  the player's eyes:
+
+  | Distance | Sound | Control |
+  |---|---|---|
+  | < 100 | `Flashbang.Ring.Long` | `control.deafenLong` |
+  | < 500 | `Flashbang.Ring.Medium` | `control.deafenMedium` |
+  | < 1000 | `Flashbang.Ring.Short` | `control.deafenShort` |
+
+  The control is sent as a `CUserMessageAudioParameter` (~0xfe4ba0): `parameter_type 0x92e1d607`,
+  `name_hash_code` = the lowercased control name hashed like a string token (MurmurHash2, seed
+  `0x31415926`), value 0. It's the muffling mix.
+- **HE deafen** (~0x1d8e50, from the player's damage handling): blast damage >= 30 plays
+  `Flashbang.Ring.Long` with `control.deafenHE`.
+- **No grenade shake.** `CBaseGrenade` vtable[309] (detonate, ~0x8bb700) only calls
+  `UTIL_ScreenShake` when vtable[313] (shake amplitude) is non-zero. Every CS grenade projectile
+  (HE, flash, smoke, molotov, decoy) returns 0. The 25/150/1/750 shake found first is the
+  `shake` console command ("Shake the screen.", ~0xd86c70), not the HE. The first in-game test
+  used it and shook far too much.
+- **C4 shake** (~0x9f4110, the C4 explosion): `UTIL_ScreenShake(bomb, 3, 150, 0.5, 10000,
+  SHAKE_START, no air shake)`. `UTIL_ScreenShake` (~0xfe3fa0) caps the amplitude at 16 and
+  skips players who aren't on the ground. `ComputeShakeAmplitude` falls off linearly
+  (`amp * (1 - dist / radius)`).
+
+Client side:
+
+- The shake ends in `CViewEffects::Shake(ScreenShake_t *)`: the per-slot array (stride
+  0xa8) found through `shake_testpunch`, vtable[4]. `ScreenShake_t` is { command, amplitude,
+  frequency, duration, direction[3] }.
+- The `CUserMessageAudioParameter` handler (~0xb9ff80) calls the sound system's
+  vtable[0x1b8 / 8] with the hash for that parameter type. The client uses the same call for
+  `control.DuckReverb`.
+- Ring sounds are played with the same `EmitSound(-1, &params)` as the chat sound (2D).
+
+What we do:
+
+- On the target's `player_blind`: distance from the flashbang entity (`entityid`, or the last
+  `flashbang_detonate`) to the eye position, then trigger the deafen control and play the ring.
+- On the target's HE `player_hurt` with `dmg_health + dmg_armor >= 30`: Long ring plus
+  `control.deafenHE`.
+- On `bomb_exploded`: if the target pawn is on the ground (`m_fFlags & FL_ONGROUND`), shake
+  with the falloff from the `C_PlantedC4` entity.
+
 ## Packaged as mirv_pov
 
 The spike was packaged as `mirv_pov <idx> | 0 | list | info` (code: `AfxHookSource2/MirvPov.*`),

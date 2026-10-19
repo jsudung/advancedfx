@@ -37,6 +37,8 @@ follow the POV player, also when seeking to a moment where they're dead.
   kill reward lines (" +$300 for neutralizing an enemy with the AK-47"), rebuilt from the demo.
   Radio lines play the chat sound (not with `cl_clutch_mode 1`).
 - Only the player's own team's radio voice lines are heard (GOTV demos have both teams').
+- Ear ringing (with the muffling) after flashbangs and big HE hits, and the C4 explosion screen
+  shake, like the server does for players. Grenades don't shake the screen in CS2.
 
 ## Known limitations
 
@@ -47,8 +49,7 @@ follow the POV player, also when seeking to a moment where they're dead.
   in-game Watch UI, and team chat never does.
 - **Damage direction arcs** point at the attacker, also for grenade and fire damage (the
   real game points at the grenade / fire).
-- **Not recorded in GOTV demos, so not shown:** flash/HE ringing, HE
-  screen shake, and other radio / money chat lines (radio commands, round end team income,
+- **Not recorded in GOTV demos, so not shown:** other radio / money chat lines (radio commands, round end team income,
   bomb plant reward).
 - **Kill reward lines** take the amount from the player's money change, so there's no line
   when it doesn't change (e.g. at max money).
@@ -67,6 +68,8 @@ follow the POV player, also when seeking to a moment where they're dead.
 | `killreward 0\|1` | 1 | Kill reward chat lines |
 | `enemyradio 0\|1` | 0 | 1 keeps the enemy team's radio voice lines audible |
 | `spectools 0\|1` | 0 | 1 allows spectator tools (x-ray) while in POV |
+| `bombshake 0\|1` | 1 | C4 explosion screen shake |
+| `earringing 0\|1` | 1 | Ear ringing after flashbangs and HE hits |
 | `damagereport 0\|1\|show` | 1 | Round end damage report; `show` = now, with what's collected so far |
 | `spectarget 0\|1` | 1 | Demo UI's spectated player = POV player (also while dead) |
 | `chatlog 0\|1` | 0 | Log chat messages arriving at the chat HUD |
@@ -94,6 +97,7 @@ Tested in game on a Valve MM demo and a pro tournament demo.
 | Grenade radio and kill reward chat lines | Working (incl. chat sound) |
 | Enemy radio voice muted | Working |
 | No spectator x-ray in POV | Working |
+| Flash / HE ear ringing, C4 screen shake | Working |
 | AWP/SSG scope blur | Broken (parked) |
 
 ## TODO / next steps
@@ -109,7 +113,6 @@ Missing / to fix:
       instead of the attacker's.
 - [ ] **Chat lines:** still missing: round end team
       income, bomb plant / defuse reward, radio commands (not in demos at all).
-- [ ] **Flash / HE ear ringing and HE screen shake.**
 - [ ] **AWP/SSG scope blur:** the local player's `m_vClientScopeInaccuracy` interpolation
       ignores the recording (see `mirv_pov_spike.md`).
 - [ ] **Old `CSGO-` v1 crosshair codes:** convert to the new format before applying.

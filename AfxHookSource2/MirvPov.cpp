@@ -18,6 +18,7 @@ extern SOURCESDK::CS2::ISource2EngineToClient * g_pEngineToClient;
 #include "../deps/release/Detours/src/detours.h"
 
 #include <cfloat>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -134,6 +135,31 @@ volatile unsigned char g_MuteVoPawn[c_MuteVoMaxEntities] = {};
 volatile bool g_MuteVoActive = false;
 volatile long g_MuteVoCount = 0; // diagnostics
 bool g_PovMuteEnemyRadio = true;
+
+// C4 explosion screen shake (grenades have none, their shake amplitude is 0): the server sends
+// CUserMessageShake to players on the ground: UTIL_ScreenShake(bomb, amplitude 3, frequency 150,
+// duration 0.5, radius 10000, SHAKE_START), amplitude falling off linearly to 0 at the radius.
+// Client side that ends in CViewEffects::Shake(ScreenShake_t *) (per split screen slot, vtable[4]).
+typedef void (__fastcall * ViewEffects_Shake_t)(void * pViewEffects, void * pShake);
+unsigned char * g_pViewEffects = nullptr; // slot 0
+int g_ViewEffectsShakeIndex = -1;
+bool g_PovBombShake = true;
+const float c_BombShakeAmplitude = 3.0f;
+const float c_BombShakeFrequency = 150.0f;
+const float c_BombShakeDuration = 0.5f;
+const float c_BombShakeRadius = 10000.0f;
+
+// Ear ringing: the server plays Flashbang.Ring.* to that player only, together with a
+// CUserMessageAudioParameter that triggers the matching "control.deafen*" mix (muffling): for
+// blinded players by the distance between the flash and their eyes (< 100 Long, < 500 Medium,
+// < 1000 Short), and Long / control.deafenHE for HE damage >= 30. The client's handler for that
+// parameter type calls the sound system's vtable[0x1b8 / 8] with the hashed control name.
+typedef void (__fastcall * SoundSystem_TriggerControl_t)(void * pSoundSystem, unsigned int nameHash);
+void ** g_ppSoundSystem = nullptr;
+int g_SoundSystemTriggerControlIndex = -1;
+bool g_PovEarRinging = true;
+float g_LastFlashPos[3] = {};
+int g_LastFlashTick = -1;
 
 // Spectator tools (x-ray: every player glows through walls in team colour, ...) are on when
 //   force_spectator_only_tools || (local->m_bIsLocalPlayerController ? g_bIsHLTV : local->m_bIsHLTV) || <pawn / game mode checks>
@@ -981,6 +1007,9 @@ void PrintInfo() {
 				nullptr != g_Org_SpectatorToolsEnabled ? "OK" : "MISSING", g_PovNoSpectatorTools ? 1 : 0, g_SpecToolsLastOriginal ? 1 : 0, g_SpecToolsBlocked,
 				forceTools, GetEntityIndex(pLocal), localIsLocal, localIsHltv, cachedHltv);
 		}
+		InfoPrintf("C4 shake: view effects %s, on %i (m_fFlags +0x%llx) | ear ringing: on %i, deafen control %s\n",
+			nullptr != g_pViewEffects ? "OK" : "MISSING", g_PovBombShake ? 1 : 0, (unsigned long long)g_clientDllOffsets.C_BaseEntity.m_fFlags,
+			g_PovEarRinging ? 1 : 0, nullptr != g_ppSoundSystem ? "OK" : "MISSING");
 		InfoPrintf("Chat sound: %s | enemy radio mute: hook %s, on %i, active %i, muted so far %li (hash +0x%llx, source +0x%llx)\n",
 			nullptr != g_EmitSound ? "OK" : "MISSING", nullptr != g_Org_SosStartSoundEvent_Parse ? "OK" : "MISSING",
 			g_PovMuteEnemyRadio ? 1 : 0, g_MuteVoActive ? 1 : 0, g_MuteVoCount,
@@ -1258,6 +1287,31 @@ void MirvPov_HookClientDll(HMODULE clientDll) {
 		} else advancedfx::Warning("mirv_pov: chat sound not found (radio lines without sound).\n");
 	}
 
+	// shake_testpunch: slot = engine->GetActiveSlot(&tmp); g_ViewEffects[slot] (stride 0xa8)->Shake(&shake):
+	//   movsxd rcx, [rax]; imul rax, rcx, 0A8h; lea rcx, [g_ViewEffects]; add rcx, rax; mov rax, [rcx]; call [rax+Shake]
+	{
+		Afx::BinUtils::MemRange veResult = Afx::BinUtils::FindPatternString(textRange,
+			"48 8B 0D ?? ?? ?? ?? 48 8D 94 24 ?? ?? ?? ?? 48 8B 01 FF 90 ?? ?? ?? ?? 48 8D 54 24 20 48 63 08 48 69 C1 A8 00 00 00 "
+			"48 8D 0D ?? ?? ?? ?? 48 03 C8 48 8B 01 FF 50 ??");
+		if (!veResult.IsEmpty()) {
+			g_pViewEffects = (unsigned char *)(veResult.Start + 0x27 + 7 + ReadRel32(veResult.Start + 0x2a));
+			g_ViewEffectsShakeIndex = *(unsigned char *)(veResult.Start + 0x36) / 8;
+		} else advancedfx::Warning("mirv_pov: view effects not found (no C4 screen shake).\n");
+	}
+
+	// CUserMessageAudioParameter handler: by parameter_type (+0x48) token: ... the third one:
+	//   cmp [token], eax; jne; mov rcx, [g_pSoundSystem]; mov edx, [msg+name_hash_code]; mov rax, [rcx]; jmp [rax+TriggerControl]
+	{
+		Afx::BinUtils::MemRange apResult = Afx::BinUtils::FindPatternString(textRange,
+			"8B 41 48 48 8B D1 39 05 ?? ?? ?? ?? 75 ?? 48 8B 0D ?? ?? ?? ?? 45 33 C9 F3 0F 10 52 50 8B 52 4C 48 8B 01 48 FF A0 ?? ?? ?? ?? "
+			"39 05 ?? ?? ?? ?? 75 ?? 48 8B 0D ?? ?? ?? ?? 44 8B 42 54 8B 52 4C 48 8B 01 48 FF A0 ?? ?? ?? ?? "
+			"39 05 ?? ?? ?? ?? 75 ?? 48 8B 0D ?? ?? ?? ?? 8B 52 4C 48 8B 01 48 FF A0");
+		if (!apResult.IsEmpty() && 0x92e1d607 == *(unsigned int *)(apResult.Start + 0x4a + 6 + ReadRel32(apResult.Start + 0x4c))) {
+			g_ppSoundSystem = (void **)(apResult.Start + 0x52 + 7 + ReadRel32(apResult.Start + 0x55));
+			g_SoundSystemTriggerControlIndex = ReadRel32(apResult.Start + 0x62) / 8;
+		} else advancedfx::Warning("mirv_pov: audio parameter handler not found (ear ringing without muffling).\n");
+	}
+
 	// Spectator tools check: push rbx; ...; mov rax, [force_spectator_only_tools]; cmp byte ptr [rax+value], 0; jne true;
 	// local = GetSplitScreenPlayer(0); cmp byte ptr [local+m_bIsLocalPlayerController], 0; je; movzx eax, [g_bIsHLTV]; jmp; movzx eax, [local+m_bIsHLTV]
 	{
@@ -1448,6 +1502,19 @@ static int GetGameEventInt(SOURCESDK::CS2::IGameEvent * pEvent, const char * psz
 }
 
 // Must not contain objects with destructors (SEH).
+static float GetGameEventFloat(SOURCESDK::CS2::IGameEvent * pEvent, const char * pszKey) {
+	if (nullptr == g_Original_hashString) return 0.0f;
+	__try {
+		unsigned int len = (unsigned int)strlen(pszKey);
+		SOURCESDK::CS2::CKV3MemberName key((int)g_Original_hashString(pszKey, len, len ^ 0x31415926), -1, pszKey);
+		return pEvent->GetFloat(key);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return 0.0f;
+	}
+}
+
+// Must not contain objects with destructors (SEH).
 static bool GetGameEventBool(SOURCESDK::CS2::IGameEvent * pEvent, const char * pszKey) {
 	if (nullptr == g_Original_hashString) return false;
 	__try {
@@ -1623,21 +1690,157 @@ static bool GetPlaceName(void * pPawn, char * pOut, size_t outSize) {
 }
 
 // Must not contain objects with destructors (SEH).
-static void PlayChatSound() {
-	if (nullptr == g_EmitSound) return;
+static bool EmitLocalSound(const char * pszSoundEvent) {
+	if (nullptr == g_EmitSound) return false;
 	__try {
-		if (nullptr != g_ppClutchModeCvar && nullptr != *g_ppClutchModeCvar && 0 != *(*g_ppClutchModeCvar + g_OfsClutchModeValue)) return;
 		alignas(16) unsigned char params[0x40] = {};
-		*(const char **)params = "HudChat.Message";
+		*(const char **)params = pszSoundEvent;
 		*(float *)(params + 0x14) = 1.0f;
 		*(int *)(params + 0x1c) = -1;
 		*(unsigned short *)(params + 0x28) = 100;
 		params[0x2a] = 1;
 		g_EmitSound(-1, params);
+		return true;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 		g_EmitSound = nullptr;
+		return false;
 	}
+}
+
+// Must not contain objects with destructors (SEH).
+static void PlayChatSound() {
+	__try {
+		if (nullptr != g_ppClutchModeCvar && nullptr != *g_ppClutchModeCvar && 0 != *(*g_ppClutchModeCvar + g_OfsClutchModeValue)) return;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return;
+	}
+	EmitLocalSound("HudChat.Message");
+}
+
+// Must not contain objects with destructors (SEH).
+static bool IsOnGround(void * pEntity) {
+	if (0 == g_clientDllOffsets.C_BaseEntity.m_fFlags) return true;
+	__try {
+		return 0 != (*(unsigned int *)((unsigned char *)pEntity + g_clientDllOffsets.C_BaseEntity.m_fFlags) & 1); // FL_ONGROUND
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return true;
+	}
+}
+
+// Must not contain objects with destructors (SEH).
+static bool StartScreenShake(float amplitude, float frequency, float duration) {
+	if (nullptr == g_pViewEffects || g_ViewEffectsShakeIndex < 0) return false;
+	__try {
+		struct { int Command; float Amplitude; float Frequency; float Duration; float Direction[3]; } shake = { 0 /* SHAKE_START */, amplitude, frequency, duration, { 0, 0, 0 } };
+		((ViewEffects_Shake_t)(*(void ***)g_pViewEffects)[g_ViewEffectsShakeIndex])(g_pViewEffects, &shake);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		g_pViewEffects = nullptr;
+		return false;
+	}
+}
+
+static float Distance(const float a[3], const float b[3]) {
+	float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+	return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+static bool IsPovActive() {
+	return nullptr != g_KillCamLastSwapped && 0 == g_KillCamSuspendFrames;
+}
+
+// Must not contain objects with destructors (SEH).
+static bool GetPlantedC4Origin(float outOrigin[3]) {
+	__try {
+		int highest = GetHighestEntityIndex();
+		for (int i = 65; i <= highest; ++i) {
+			CEntityInstance * pEnt = GetEntity(i);
+			if (nullptr == pEnt) continue;
+			const char * pszClass = pEnt->GetClientClassName();
+			if (nullptr == pszClass || 0 != strcmp(pszClass, "C_PlantedC4")) continue;
+			pEnt->GetOrigin(outOrigin[0], outOrigin[1], outOrigin[2]);
+			return FLT_MAX != outOrigin[0];
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return false;
+}
+
+static void Effects_OnBombExploded() {
+	if (!g_PovBombShake || !IsPovActive()) return;
+	CEntityInstance * pPawn = (CEntityInstance *)GetSwappedTargetPlayerPawn();
+	if (nullptr == pPawn || !IsOnGround(pPawn)) return; // no air shake
+	float bomb[3];
+	if (!GetPlantedC4Origin(bomb)) return;
+	float origin[3];
+	pPawn->GetOrigin(origin[0], origin[1], origin[2]);
+	if (FLT_MAX == origin[0]) return;
+	float distance = Distance(bomb, origin);
+	if (c_BombShakeRadius < distance) return;
+	float amplitude = c_BombShakeAmplitude * (1.0f - distance / c_BombShakeRadius);
+	if (0.0f < amplitude) StartScreenShake(amplitude, c_BombShakeFrequency, c_BombShakeDuration);
+}
+
+// Must not contain objects with destructors (SEH).
+static void TriggerSoundControl(const char * pszLowerCaseName) {
+	if (nullptr == g_ppSoundSystem || g_SoundSystemTriggerControlIndex < 0 || nullptr == g_Original_hashString) return;
+	__try {
+		void * pSoundSystem = *g_ppSoundSystem;
+		if (nullptr == pSoundSystem) return;
+		unsigned int len = (unsigned int)strlen(pszLowerCaseName);
+		unsigned int hash = g_Original_hashString(pszLowerCaseName, len, len ^ 0x31415926);
+		((SoundSystem_TriggerControl_t)(*(void ***)pSoundSystem)[g_SoundSystemTriggerControlIndex])(pSoundSystem, hash);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		g_ppSoundSystem = nullptr;
+	}
+}
+
+static void PlayEarRinging(const char * pszRing, const char * pszDeafenControl) {
+	TriggerSoundControl(pszDeafenControl);
+	EmitLocalSound(pszRing);
+}
+
+static void Effects_OnFlashDetonate(SOURCESDK::CS2::IGameEvent * pEvent) {
+	g_LastFlashPos[0] = GetGameEventFloat(pEvent, "x");
+	g_LastFlashPos[1] = GetGameEventFloat(pEvent, "y");
+	g_LastFlashPos[2] = GetGameEventFloat(pEvent, "z");
+	g_LastFlashTick = GetDemoTick();
+}
+
+// Flashbang deafen: only for blinded players, by the distance between the flash and the player's eyes.
+static void Effects_OnPlayerBlind(SOURCESDK::CS2::IGameEvent * pEvent) {
+	if (!g_PovEarRinging || !IsPovActive()) return;
+	if (GetGameEventPlayerController(pEvent, "userid") != g_KillCamLastSwapped) return;
+	CEntityInstance * pPawn = (CEntityInstance *)GetSwappedTargetPlayerPawn();
+	if (nullptr == pPawn) return;
+	float flash[3] = { FLT_MAX, 0, 0 };
+	int flashEntity = GetGameEventInt(pEvent, "entityid");
+	if (CEntityInstance * pFlash = 0 < flashEntity ? GetEntity(flashEntity) : nullptr) pFlash->GetOrigin(flash[0], flash[1], flash[2]);
+	if (FLT_MAX == flash[0]) {
+		if (g_LastFlashTick < 0 || 64 < abs(GetDemoTick() - g_LastFlashTick)) return;
+		memcpy(flash, g_LastFlashPos, sizeof(flash));
+	}
+	float eye[3];
+	pPawn->GetRenderEyeOrigin(eye);
+	float distance = Distance(flash, eye);
+	if (distance < 100.0f) PlayEarRinging("Flashbang.Ring.Long", "control.deafenlong");
+	else if (distance < 500.0f) PlayEarRinging("Flashbang.Ring.Medium", "control.deafenmedium");
+	else if (distance < 1000.0f) PlayEarRinging("Flashbang.Ring.Short", "control.deafenshort");
+}
+
+// HE deafen: blast damage of 30 or more.
+static void Effects_OnHurt(SOURCESDK::CS2::IGameEvent * pEvent) {
+	if (!g_PovEarRinging || !IsPovActive()) return;
+	if (GetGameEventPlayerController(pEvent, "userid") != g_KillCamLastSwapped) return;
+	if (0 != strcmp(StripWeaponPrefix(GetGameEventString(pEvent, "weapon")), "hegrenade")) return;
+	if (GetGameEventInt(pEvent, "dmg_health") + GetGameEventInt(pEvent, "dmg_armor") < 30) return;
+	PlayEarRinging("Flashbang.Ring.Long", "control.deafenhe");
 }
 
 // Grenade radio, sent by the server to the thrower's team.
@@ -1851,6 +2054,22 @@ bool MirvPov_BeforeClientGameEvent(SOURCESDK::CS2::IGameEvent * pEvent) {
 
 	if (0 == strcmp(pszName, "player_hurt")) {
 		DamageArcs_OnHurt(pEvent);
+		Effects_OnHurt(pEvent);
+		return false;
+	}
+
+	if (0 == strcmp(pszName, "bomb_exploded")) {
+		Effects_OnBombExploded();
+		return false;
+	}
+
+	if (0 == strcmp(pszName, "flashbang_detonate")) {
+		Effects_OnFlashDetonate(pEvent);
+		return false;
+	}
+
+	if (0 == strcmp(pszName, "player_blind")) {
+		Effects_OnPlayerBlind(pEvent);
 		return false;
 	}
 
@@ -2044,6 +2263,14 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 			return;
 		}
 
+		if ((0 == _stricmp(cmd, "bombshake") || 0 == _stricmp(cmd, "earringing")) && 3 <= argc) {
+			bool bOn = 0 != atoi(args->ArgV(2));
+			if (0 == _stricmp(cmd, "bombshake")) g_PovBombShake = bOn;
+			else g_PovEarRinging = bOn;
+			advancedfx::Message("mirv_pov: %s %s.\n", 0 == _stricmp(cmd, "bombshake") ? "C4 explosion screen shake" : "flash / HE ear ringing", bOn ? "on" : "off");
+			return;
+		}
+
 		if (0 == _stricmp(cmd, "spectools") && 3 <= argc) {
 			if (nullptr == g_Org_SpectatorToolsEnabled) {
 				advancedfx::Warning("mirv_pov: spectator tools hook not installed.\n");
@@ -2122,12 +2349,14 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s damagearcs <0|1> - Damage direction arcs when the player gets hit (default 1).\n"
 		"%s radio <0|1> - Grenade radio chat lines of the player's team (default 1).\n"
 		"%s killreward <0|1> - Kill reward chat lines (default 1).\n"
-		"%s spectools <0|1> - 1 allows spectator tools like x-ray while in POV (default 0).\n"
+		"%s bombshake <0|1> - C4 explosion screen shake (default 1). Grenades don't shake the screen in CS2.\n"
+		"%s earringing <0|1> - Ear ringing after flashbangs and HE hits (default 1).\n"
+		"%s spectools <0|1> -1 allows spectator tools like x-ray while in POV (default 0).\n"
 		"%s enemyradio <0|1> -1 keeps the enemy team's radio voice lines audible (default 0, muted like for a player).\n"
 		"%s spectarget <0|1> - Make the demo UI's spectated player (and its markers) the POV player, also while dead (default 1).\n"
 		"%s chatlog <0|1> - Log chat (SayText2) messages arriving at the chat HUD.\n"
 		"%s hltvlog [0|1] - IsHLTV() caller logging on (resets) / off, without argument prints the callers.\n"
 		"%s diag <0|1> - Diagnostic logging to console and %%TEMP%%\\mirv_pov_log.txt (default 0).\n"
-		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
+		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
 	);
 }
