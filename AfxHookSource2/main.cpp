@@ -20,6 +20,7 @@
 #include "MirvCommands.h"
 #include "MirvColors.h"
 #include "MirvFix.h"
+#include "MirvPov.h"
 #include "MirvTime.h"
 
 #include "../deps/release/prop/AfxHookSource/SourceSdkShared.h"
@@ -1201,6 +1202,8 @@ void HookClientDll(HMODULE clientDll) {
 			Hook_GetSplitScreenPlayer((void*)range_get_split_screen_player.Start);
 		} else ErrorBox(MkErrStr(__FILE__, __LINE__));
 	}
+
+	MirvPov_HookClientDll(clientDll);
 }
 
 SOURCESDK::CreateInterfaceFn g_AppSystemFactory = nullptr;
@@ -1444,6 +1447,7 @@ CS2_Client_LevelInitPreEntity_t old_CS2_Client_LevelInitPreEntity;
 void * new_CS2_Client_LevelInitPreEntity(void* This, void * pUnk1, void * pUnk2) {
 	resetDefaultCloudColors();
 	resetCachedMaterials();
+	MirvPov_OnLevelInitPreEntity();
 	void * result = old_CS2_Client_LevelInitPreEntity(This, pUnk1, pUnk2);
 	g_CommandSystem.OnLevelInitPreEntity();
 	return result;
@@ -1524,6 +1528,8 @@ void  new_CS2_Client_FrameStageNotify(void* This, SOURCESDK::CS2::ClientFrameSta
 		if(g_SleepMs) Sleep(g_SleepMs);
 		break;
 	}
+
+	MirvPov_BeforeFrameStageNotify(curStage);
 
 	AfxHookSource2Rs_Engine_OnClientFrameStageNotify(curStage, true);
 
@@ -2132,6 +2138,8 @@ void LibraryHooksW(HMODULE hModule, LPCWSTR lpLibFileName)
 		Hook_Engine_RenderService();
 
 		Hook_Engine__HostStateRequest_Start();
+
+		MirvPov_HookEngine2Dll(hModule);
 	}
 	else if(bFirstSceneSystem && StringEndsWithW( lpLibFileName, L"scenesystem.dll"))
 	{

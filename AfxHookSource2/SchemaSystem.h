@@ -54,11 +54,18 @@ struct ClientDllOffsets_t {
 		ptrdiff_t m_iszPlayerName = 0; // char[128]
 		ptrdiff_t m_steamID = 0; // uint64
 		ptrdiff_t m_hPawn = 0; // CHandle< C_CSPlayerPawnBase >
+		ptrdiff_t m_bIsLocalPlayerController = 0; // bool, optional (0 if not found)
 	} CBasePlayerController;
 
 	struct CCSPlayerController {
 		ptrdiff_t m_sSanitizedPlayerName = 0; // CUtlString
+		ptrdiff_t m_szCrosshairCodes = 0; // CUtlSymbolLarge (const char *), optional (0 if not found)
+		ptrdiff_t m_hPlayerPawn = 0; // CHandle< C_CSPlayerPawn >, optional (0 if not found)
 	} CCSPlayerController;
+
+	struct C_CSPlayerPawn {
+		ptrdiff_t m_bIsBuyMenuOpen = 0; // bool, optional (0 if not found)
+	} C_CSPlayerPawn;
 
 	struct C_BasePlayerPawn {
 		ptrdiff_t m_hController = 0; // CHandle< CBasePlayerController >

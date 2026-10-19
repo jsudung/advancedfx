@@ -117,7 +117,13 @@ void initSchemaSystemOffsets()
 	bOk = bOk && getOffset(&g_clientDllOffsets.C_EnvSky.m_vTintColor, "client.dll", "C_EnvSky", "m_vTintColor");
 	bOk = bOk && getOffset(&g_clientDllOffsets.C_EnvSky.m_flBrightnessScale, "client.dll", "C_EnvSky", "m_flBrightnessScale");
 
-	if (!bOk) ErrorBox(MkErrStr(__FILE__, __LINE__));	
+	if (!bOk) ErrorBox(MkErrStr(__FILE__, __LINE__));
+
+	// Optional (experimental mirv_pov_spike), no error if missing:
+	getOffset(&g_clientDllOffsets.CBasePlayerController.m_bIsLocalPlayerController, "client.dll", "CBasePlayerController", "m_bIsLocalPlayerController");
+	getOffset(&g_clientDllOffsets.C_CSPlayerPawn.m_bIsBuyMenuOpen, "client.dll", "C_CSPlayerPawn", "m_bIsBuyMenuOpen");
+	getOffset(&g_clientDllOffsets.CCSPlayerController.m_szCrosshairCodes, "client.dll", "CCSPlayerController", "m_szCrosshairCodes");
+	getOffset(&g_clientDllOffsets.CCSPlayerController.m_hPlayerPawn, "client.dll", "CCSPlayerController", "m_hPlayerPawn");
 }
 
 void HookSchemaSystem(HMODULE schemaSystemDll)

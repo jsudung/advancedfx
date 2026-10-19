@@ -10,6 +10,7 @@
 #include "../shared/binutils.h"
 
 #include "AfxHookSource2Rs.h"
+#include "MirvPov.h"
 
 #include <Windows.h>
 #include "../deps/release/Detours/src/detours.h"
@@ -84,7 +85,13 @@ bool New_CGameEventManager_FireEventClientSide( void * This, SOURCESDK::CS2::CGa
 
     if(g_b_on_game_event) SendGameEvent(event);
 
-    return g_Old_CGameEventManager_FireEventClientSide(This, event);
+    bool bPovBefore = MirvPov_BeforeClientGameEvent(event);
+
+    bool result = g_Old_CGameEventManager_FireEventClientSide(This, event); // frees event
+
+    MirvPov_AfterClientGameEvent(bPovBefore);
+
+    return result;
 }
 
 bool Hook_CGameEventManager(void* addrClientDll) {
