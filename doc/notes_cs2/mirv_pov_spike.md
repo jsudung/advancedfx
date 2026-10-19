@@ -324,6 +324,25 @@ event vtable +0xe8, `SetEntity("target", GetObserverTarget())` via +0xd0). We ho
 with the target's `m_hPlayerPawn` entity (it exists while dead) before the listeners run.
 The vtable index is read from the sender (`mov rdi, [rcx+disp]` at +0xbf).
 
+### Damage direction arcs
+
+`CCSGO_HudDamageIndicator` (panels `DamageTop/Right/Bottom/Left`) hooks `CCSUsrMsg_Damage`
+(handler ~0xe86d80):
+
+- In GOTV mode (cached IsHLTV) it requires the observer to be in-eye on `victim_entindex`.
+- Otherwise it needs `GetSplitScreenPlayerPawn(0)` to be an alive player pawn.
+- If `amount` (+0x50) > 0 it calls `ShowDirection(this, &inflictor_world_pos (+0x48), pawn)`
+  (~0xe7bae0). That function takes the direction from the pawn's origin to the inflictor,
+  projects it on the forward / right vectors of the slot's main view angles (~0x256af58),
+  and raises the front / back / right / left intensities (this +0x60 / +0x64 / +0x68 /
+  +0x6c). The element's think fades them out.
+
+The message isn't in GOTV demos. On the swapped target's `player_hurt` (still alive, damage
+> 0, attacker another player) we call `ShowDirection` with
+`FindHudElement("CCSGO_HudDamageIndicator") - 0x20`, the target's player pawn and the
+attacker pawn's origin. The address comes from the handler's call site. The red screen edge
+flash is a separate path (`HUD--health--on-damage`) and already worked.
+
 ## Packaged as mirv_pov
 
 The spike was packaged as `mirv_pov <idx> | 0 | list | info` (code: `AfxHookSource2/MirvPov.*`),

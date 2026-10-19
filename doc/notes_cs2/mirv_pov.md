@@ -27,6 +27,7 @@ follow the POV player, also when seeking to a moment where they're dead.
 - The player's own crosshair (new-format `CS...` crosshair codes).
 - No buy-menu blur when the player opens their buy menu.
 - Death camera and the "killed you with ..." death card.
+- Damage direction arcs when the player gets hit (pointing at the attacker).
 - Round end damage report under the avatars (damage / hits given and taken, kill type). It's
   rebuilt from the demo's hurt and death events as they play. Seeking back into a round
   you've already watched is fine. If you skip part of a round by seeking forward, the report
@@ -40,8 +41,9 @@ follow the POV player, also when seeking to a moment where they're dead.
   current CS2, which then uses your own crosshair (same as normal spectating).
 - **Chat in Valve matchmaking demos** is encrypted. Global chat only shows when watched via the
   in-game Watch UI, and team chat never does.
-- **Not recorded in GOTV demos, so not shown:** damage-direction arcs, flash/HE ringing, HE
-  screen shake, radio texts and kill-reward ("+$300") chat lines.
+- **Damage direction arcs** point at the attacker, also for grenade and fire damage (the
+  real game points at the grenade / fire).
+- **Not recorded in GOTV demos, so not shown:** flash/HE ringing, HE screen shake, radio texts and kill-reward ("+$300") chat lines.
 
 ## Advanced switches (`mirv_pov_debug`)
 
@@ -52,6 +54,7 @@ follow the POV player, also when seeking to a moment where they're dead.
 | `buymenu 0\|1` | 0 | 1 keeps the recorded buy menu state (blurred view) |
 | `predict 0\|1` | 0 | 1 lets the game predict the player's pawn (game default) |
 | `deathcard 0\|1` | 1 | Show the death card |
+| `damagearcs 0\|1` | 1 | Damage direction arcs |
 | `damagereport 0\|1\|show` | 1 | Round end damage report; `show` = now, with what's collected so far |
 | `spectarget 0\|1` | 1 | Demo UI's spectated player = POV player (also while dead) |
 | `chatlog 0\|1` | 0 | Log chat messages arriving at the chat HUD |
@@ -72,6 +75,7 @@ Tested in game on a Valve MM demo and a pro tournament demo.
 | Player crosshair | Working for `CS-` codes; old `CSGO-` v1 codes fall back to yours |
 | Buy menu blur suppressed | Working |
 | Death camera, death card | Working |
+| Damage direction arcs | Working; grenade / fire damage points at the thrower |
 | Round end damage report | Working when played through; some inconsistencies after seeks |
 | Demo UI spectated player / markers | Working; some inconsistencies after seeks |
 | Chat | Working where readable (MM demo chat is encrypted) |
@@ -86,8 +90,8 @@ Missing / to fix:
       `mirv_pov info`.
 - [ ] **Forward seeks:** the damage report misses events in the skipped part of a round.
       Could fill it by reading the demo's events ahead, or by noting the gap.
-- [ ] **Damage-direction arcs** (`CCSUsrMsg_Damage` isn't in GOTV demos): rebuild from
-      `player_hurt` plus the attacker's position.
+- [ ] **Damage direction arcs, grenade / fire damage:** use the grenade or inferno position
+      instead of the attacker's.
 - [ ] **Chat lines:** kill reward ("+$300"), radio texts.
 - [ ] **Flash / HE ear ringing and HE screen shake.**
 - [ ] **AWP/SSG scope blur:** the local player's `m_vClientScopeInaccuracy` interpolation

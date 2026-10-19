@@ -17,6 +17,7 @@ extern SOURCESDK::CS2::ISource2EngineToClient * g_pEngineToClient;
 
 #include "../deps/release/Detours/src/detours.h"
 
+#include <cfloat>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -86,6 +87,14 @@ GetSplitScreenPlayerPawn_t g_Org_GetSplitScreenPlayerPawn = nullptr;
 enum DeathPanelSite_e { DeathPanelSite_Event = 0, DeathPanelSite_Show, DeathPanelSite_Think, DeathPanelSite_Count };
 size_t g_DeathPanelPawnRetAddrs[DeathPanelSite_Count] = {};
 bool g_PovDeathCard = true;
+
+// Damage direction arcs: the CCSUsrMsg_Damage handler (CCSGO_HudDamageIndicator) checks the local
+// pawn is alive and calls ShowDirection(indicator, &inflictorWorldPos, localPawn), which raises the
+// arc intensities. The message isn't in GOTV demos, so we call it on the target's player_hurt, with
+// the attacker's position as the inflictor.
+typedef void (__fastcall * DamageIndicator_ShowDirection_t)(void * pIndicator, const float * pInflictorPos, void * pPawn);
+DamageIndicator_ShowDirection_t g_DamageIndicator_ShowDirection = nullptr;
+bool g_PovDamageArcs = true;
 
 // As local player the target's pawn (and its weapons / viewmodel) becomes predictable, so the
 // client shows its own predicted copy of some values instead of the recorded ones. Without user
@@ -870,7 +879,8 @@ void PrintInfo() {
 			DamageReport_GetRoundWinStatus(winStatus);
 			if (nullptr != *g_DmgReport.ppUseNetvarsCvar) useNetvars = *(*g_DmgReport.ppUseNetvarsCvar + g_DmgReport.OfsCvarValue) ? 1 : 0;
 		}
-		InfoPrintf("Damage report: hook %s, on %i, sv_dev_damage_use_netvars %i, round win status %i, round %i, events %i, last result %i | spec target fix: %s, on %i\n",
+		InfoPrintf("Damage arcs: hook %s, on %i\n", nullptr != g_DamageIndicator_ShowDirection ? "OK" : "MISSING", g_PovDamageArcs ? 1 : 0);
+		InfoPrintf("Damage report: hook %s, on %i,sv_dev_damage_use_netvars %i, round win status %i, round %i, events %i, last result %i | spec target fix: %s, on %i\n",
 			nullptr != g_DmgReport.Report ? "OK" : "MISSING", g_PovDamageReport ? 1 : 0, useNetvars, winStatus,
 			nullptr != g_DmgReport.Report ? DamageReport_GetRound() : -1, (int)g_DmgEvents.size(), g_DmgLastResult,
 			0 <= g_GameEventSetEntityIndex ? "OK" : "MISSING", g_PovSpecTarget ? 1 : 0);
@@ -1104,6 +1114,16 @@ void MirvPov_HookClientDll(HMODULE clientDll) {
 		} else advancedfx::Warning("mirv_pov: damage list callback not found (no round end damage report).\n");
 	}
 
+	// CCSUsrMsg_Damage handler: if (msg.amount > 0) ShowDirection(this, &msg.inflictor_world_pos, pawn)
+	{
+		Afx::BinUtils::MemRange arcResult = Afx::BinUtils::FindPatternString(textRange,
+			"83 7F 50 00 0F 8E ?? ?? ?? ?? 48 8B 47 48 48 8D 0D ?? ?? ?? ?? 48 85 C0 48 8D 54 24 ?? 4C 8B C3 48 0F 45 C8 "
+			"F3 0F 10 41 18 F3 0F 10 49 1C F3 0F 11 44 24 ?? F3 0F 10 41 20 48 8B CD F3 0F 11 44 24 ?? F3 0F 11 4C 24 ?? E8");
+		if (!arcResult.IsEmpty()) {
+			g_DamageIndicator_ShowDirection = (DamageIndicator_ShowDirection_t)(arcResult.Start + 0x48 + 5 + ReadRel32(arcResult.Start + 0x49));
+		} else advancedfx::Warning("mirv_pov: CCSUsrMsg_Damage handler not found (no damage direction arcs).\n");
+	}
+
 	// "spec_target_updated" sender (CCSObserver_ObserverServices): event = CreateEvent(..); SetPlayer("userid", pawn);
 	// mov rdi, [rcx+SetEntity] (+0xbf); ...; SetEntity("target", GetObserverTarget())
 	{
@@ -1318,6 +1338,37 @@ static void FixSpecTargetEvent(SOURCESDK::CS2::IGameEvent * pEvent) {
 }
 
 // Must not contain objects with destructors (SEH).
+static bool ShowDamageArc(void * pVictimPawn, const float * pInflictorPos) {
+	FindHudElement_t findHudElement = nullptr != g_FindHudElement ? g_FindHudElement : g_DmgReport.FindHudElement;
+	if (nullptr == findHudElement) return false;
+	__try {
+		void * pElement = findHudElement("CCSGO_HudDamageIndicator");
+		if (nullptr == pElement) return false;
+		g_DamageIndicator_ShowDirection((unsigned char *)pElement - 0x20, pInflictorPos, pVictimPawn);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+static void DamageArcs_OnHurt(SOURCESDK::CS2::IGameEvent * pEvent) {
+	if (!g_PovDamageArcs || nullptr == g_DamageIndicator_ShowDirection || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames) return;
+	if (GetGameEventPlayerController(pEvent, "userid") != g_KillCamLastSwapped) return;
+	// Like the handler: only while alive, and only for damage.
+	if (GetGameEventInt(pEvent, "health") <= 0 || GetGameEventInt(pEvent, "dmg_health") <= 0) return;
+	int attacker = GetEntityIndex(GetGameEventPlayerController(pEvent, "attacker"));
+	if (attacker < 1 || attacker == g_KillCamTarget) return; // world / self (e.g. fall damage): no direction
+	void * pVictimPawn = GetSwappedTargetPlayerPawn();
+	CEntityInstance * pAttackerPawn = (CEntityInstance *)GetTargetPlayerPawn(attacker);
+	if (nullptr == pVictimPawn || nullptr == pAttackerPawn) return;
+	float pos[3];
+	pAttackerPawn->GetOrigin(pos[0], pos[1], pos[2]);
+	if (FLT_MAX == pos[0]) return;
+	if (!ShowDamageArc(pVictimPawn, pos)) advancedfx::Warning("mirv_pov: showing the damage direction failed.\n");
+}
+
+// Must not contain objects with destructors (SEH).
 static bool ShowDeathCard() {
 	__try {
 		void * pElement = g_FindHudElement("CCSGO_HudDeathPanel");
@@ -1337,6 +1388,11 @@ bool MirvPov_BeforeClientGameEvent(SOURCESDK::CS2::IGameEvent * pEvent) {
 	if (nullptr == pszName) return false;
 
 	DamageReport_OnGameEvent(pEvent, pszName);
+
+	if (0 == strcmp(pszName, "player_hurt")) {
+		DamageArcs_OnHurt(pEvent);
+		return false;
+	}
 
 	if (0 == strcmp(pszName, "spec_target_updated")) {
 		FixSpecTargetEvent(pEvent);
@@ -1508,6 +1564,16 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 			return;
 		}
 
+		if (0 == _stricmp(cmd, "damagearcs") && 3 <= argc) {
+			if (nullptr == g_DamageIndicator_ShowDirection) {
+				advancedfx::Warning("mirv_pov: damage direction hook not installed.\n");
+				return;
+			}
+			g_PovDamageArcs = 0 != atoi(args->ArgV(2));
+			advancedfx::Message("mirv_pov: damage direction arcs %s.\n", g_PovDamageArcs ? "on" : "off");
+			return;
+		}
+
 		if (0 == _stricmp(cmd, "spectarget") && 3 <= argc) {
 			if (g_GameEventSetEntityIndex < 0) {
 				advancedfx::Warning("mirv_pov: spec target fix not available.\n");
@@ -1551,10 +1617,11 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s predict <0|1> - 0 keeps the player's pawn / weapons non-predicted (default), 1 = game default.\n"
 		"%s deathcard <0|1> - Show the \"killed you with\" death card (default 1).\n"
 		"%s damagereport <0|1|show> - Round end damage report under the avatars (default 1), show = now, with what's collected so far.\n"
-		"%s spectarget <0|1> - Make the demo UI's spectated player (and its markers) the POV player, also while dead (default 1).\n"
+		"%s damagearcs <0|1> - Damage direction arcs when the player gets hit (default 1).\n"
+		"%s spectarget <0|1> -Make the demo UI's spectated player (and its markers) the POV player, also while dead (default 1).\n"
 		"%s chatlog <0|1> - Log chat (SayText2) messages arriving at the chat HUD.\n"
 		"%s hltvlog [0|1] - IsHLTV() caller logging on (resets) / off, without argument prints the callers.\n"
 		"%s diag <0|1> - Diagnostic logging to console and %%TEMP%%\\mirv_pov_log.txt (default 0).\n"
-		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
+		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
 	);
 }
