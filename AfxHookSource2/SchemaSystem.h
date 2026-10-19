@@ -62,10 +62,16 @@ struct ClientDllOffsets_t {
 		ptrdiff_t m_sSanitizedPlayerName = 0; // CUtlString
 		ptrdiff_t m_szCrosshairCodes = 0; // CUtlSymbolLarge (const char *), optional (0 if not found)
 		ptrdiff_t m_hPlayerPawn = 0; // CHandle< C_CSPlayerPawn >, optional (0 if not found)
+		ptrdiff_t m_pInGameMoneyServices = 0; // CCSPlayerController_InGameMoneyServices*, optional (0 if not found)
 	} CCSPlayerController;
+
+	struct CCSPlayerController_InGameMoneyServices {
+		ptrdiff_t m_iAccount = 0; // int32, optional (0 if not found)
+	} CCSPlayerController_InGameMoneyServices;
 
 	struct C_CSPlayerPawn {
 		ptrdiff_t m_bIsBuyMenuOpen = 0; // bool, optional (0 if not found)
+		ptrdiff_t m_szLastPlaceName = 0; // char[18], optional (0 if not found)
 	} C_CSPlayerPawn;
 
 	struct C_BasePlayerPawn {

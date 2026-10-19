@@ -343,6 +343,36 @@ The message isn't in GOTV demos. On the swapped target's `player_hurt` (still al
 attacker pawn's origin. The address comes from the handler's call site. The red screen edge
 flash is a separate path (`HUD--health--on-damage`) and already worked.
 
+### Radio and kill reward chat lines
+
+Both come from player-only messages that GOTV demos don't contain:
+
+- `CCSUsrMsg_RadioText` handler (~0x11a7ca0, on the CHudChat singleton): it localizes
+  `msg_name` and four params (`#SLOTNAME[n]` becomes the player name; param 3 `auto` is
+  checked against a setting) and adds the team prefix `#game_radio_team_prefix_<team>`. It
+  calls `ChatPrintf(this, &filter{0,1}, client slot, "%s", text)` (~0x11a5440), then plays
+  `HudChat.Message`. Grenade radio uses `#Game_radio_location` (` %s4%s1﹫%s2: %s3`) or
+  `#Game_radio` with the texts `#SFUI_TitlesTXT_{Fire,Flashbang,Smoke,Molotov,Incendiary,Decoy}_in_the_hole`.
+- `CUserMessageTextMsg` (CHudChatDelegate vtable[13], ~0x11a8dc0) prints HUD_PRINTTALK
+  through the same `ChatPrintf` with client -1. Kill reward:
+  `#Player_Cash_Award_Killed_Enemy` (` +$%s1 for neutralizing an enemy with the %s2`).
+- `ChatPrintf` ignores `this`. In demo playback it skips everything when the
+  crosshair/chat hide flag (settings +0x82) is set. It formats, then hands the text to
+  `CCSGO_HudVoiceStatus`.
+
+What we do:
+
+- Radio: on `weapon_fire` with a grenade weapon from a player on the target's team
+  (including the target). The location comes from the thrower pawn's `m_szLastPlaceName`,
+  localized as `#<place>`.
+- Kill reward: the target's `player_death` kills are queued. When the target's
+  `InGameMoneyServices::m_iAccount` changes in the right direction (up; down for a team
+  kill), the change is printed as the amount (split if several kills share one change).
+  Queued kills time out after 32 ticks. Weapon names come from a weapon → `#SFUI_WPNHUD_*`
+  table, falling back to `..._Generic`.
+- Lines are built with `ILocalize::Find` (vtable index read from the handler) and our own
+  `%sN` substitution.
+
 ## Packaged as mirv_pov
 
 The spike was packaged as `mirv_pov <idx> | 0 | list | info` (code: `AfxHookSource2/MirvPov.*`),

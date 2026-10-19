@@ -96,6 +96,26 @@ typedef void (__fastcall * DamageIndicator_ShowDirection_t)(void * pIndicator, c
 DamageIndicator_ShowDirection_t g_DamageIndicator_ShowDirection = nullptr;
 bool g_PovDamageArcs = true;
 
+// Chat lines from player-only messages (CCSUsrMsg_RadioText, CUserMessageTextMsg) that GOTV demos
+// don't have: grenade radio ("[CT] Name﹫Place: Flashbang!") from teammates' weapon_fire, and the
+// kill reward (" +$300 for neutralizing an enemy with the AK-47") from the target's kills plus their
+// money change. Built from the same localization tokens and printed through the same chat print
+// function (filter {0, 1}, client = player slot or -1) as the native handlers.
+typedef void (__cdecl * ChatPrintf_t)(void * pChat, unsigned char * pFilter, int nClient, const char * pszFormat, ...);
+typedef const char * (__fastcall * Localize_Find_t)(void * pLocalize, const char * pszToken);
+ChatPrintf_t g_ChatPrintf = nullptr;
+void ** g_ppLocalize = nullptr;
+int g_LocalizeFindIndex = -1;
+bool g_PovChatRadio = true;
+bool g_PovChatMoney = true;
+
+// The radio handler plays "HudChat.Message" after the line unless cl_clutch_mode is on:
+// EmitSound(-1, &params) with params { name, ..., volume 1.0 (+0x14), -1 (+0x1c), pitch 100 (+0x28), flags (+0x2a) }.
+typedef void (__fastcall * EmitSound_t)(int nEntity, void * pParams);
+EmitSound_t g_EmitSound = nullptr;
+unsigned char ** g_ppClutchModeCvar = nullptr; // cl_clutch_mode
+ptrdiff_t g_OfsClutchModeValue = 0;
+
 // As local player the target's pawn (and its weapons / viewmodel) becomes predictable, so the
 // client shows its own predicted copy of some values instead of the recorded ones. Without user
 // input that copy freezes. C_BaseEntity::SetPredictable (vtable index 130) is detoured to keep
@@ -879,7 +899,13 @@ void PrintInfo() {
 			DamageReport_GetRoundWinStatus(winStatus);
 			if (nullptr != *g_DmgReport.ppUseNetvarsCvar) useNetvars = *(*g_DmgReport.ppUseNetvarsCvar + g_DmgReport.OfsCvarValue) ? 1 : 0;
 		}
-		InfoPrintf("Damage arcs: hook %s, on %i\n", nullptr != g_DamageIndicator_ShowDirection ? "OK" : "MISSING", g_PovDamageArcs ? 1 : 0);
+		InfoPrintf("Damage arcs: hook %s, on %i | chat lines: print %s, localize %s, radio %i, kill reward %i (money +0x%llx/+0x%llx, place +0x%llx)\n",
+			nullptr != g_DamageIndicator_ShowDirection ? "OK" : "MISSING", g_PovDamageArcs ? 1 : 0,
+			nullptr != g_ChatPrintf ? "OK" : "MISSING", nullptr != g_ppLocalize ? "OK" : "MISSING", g_PovChatRadio ? 1 : 0, g_PovChatMoney ? 1 : 0,
+			(unsigned long long)g_clientDllOffsets.CCSPlayerController.m_pInGameMoneyServices,
+			(unsigned long long)g_clientDllOffsets.CCSPlayerController_InGameMoneyServices.m_iAccount,
+			(unsigned long long)g_clientDllOffsets.C_CSPlayerPawn.m_szLastPlaceName);
+		InfoPrintf("Chat sound: %s\n", nullptr != g_EmitSound ? "OK" : "MISSING");
 		InfoPrintf("Damage report: hook %s, on %i,sv_dev_damage_use_netvars %i, round win status %i, round %i, events %i, last result %i | spec target fix: %s, on %i\n",
 			nullptr != g_DmgReport.Report ? "OK" : "MISSING", g_PovDamageReport ? 1 : 0, useNetvars, winStatus,
 			nullptr != g_DmgReport.Report ? DamageReport_GetRound() : -1, (int)g_DmgEvents.size(), g_DmgLastResult,
@@ -1124,6 +1150,35 @@ void MirvPov_HookClientDll(HMODULE clientDll) {
 		} else advancedfx::Warning("mirv_pov: CCSUsrMsg_Damage handler not found (no damage direction arcs).\n");
 	}
 
+	// CCSUsrMsg_RadioText handler: ... ChatPrintf(this, &filter, client, "%s", text); then "HudChat.Message" if enabled,
+	// and earlier: mov rcx, [g_pLocalize]; lea r15, [""]; mov rdx, r15; mov rax, [rcx]; mov r8, [rax+Find]
+	{
+		Afx::BinUtils::MemRange printResult = Afx::BinUtils::FindPatternString(textRange,
+			"4C 8D 0D ?? ?? ?? ?? 4C 89 7C 24 20 44 8B C3 48 8D 95 ?? ?? ?? ?? 49 8B CD E8 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 40 38 70 58");
+		Afx::BinUtils::MemRange locResult = Afx::BinUtils::FindPatternString(textRange,
+			"48 8B 0D ?? ?? ?? ?? 4C 8D 3D ?? ?? ?? ?? 49 8B D7 48 8B 01 4C 8B 40 78 48 8B 85 ?? ?? ?? ?? 48 85 C0 48 0F 45 D0 41 FF D0");
+		if (!printResult.IsEmpty() && !locResult.IsEmpty()
+			&& 0 == strcmp((const char *)(printResult.Start + 7 + ReadRel32(printResult.Start + 3)), "%s")) {
+			g_ChatPrintf = (ChatPrintf_t)(printResult.Start + 0x19 + 5 + ReadRel32(printResult.Start + 0x1a));
+			g_ppLocalize = (void **)(locResult.Start + 7 + ReadRel32(locResult.Start + 3));
+			g_LocalizeFindIndex = *(unsigned char *)(locResult.Start + 0x17) / 8;
+		} else advancedfx::Warning("mirv_pov: RadioText handler not found (no radio / kill reward chat lines).\n");
+		if (!printResult.IsEmpty()) {
+			g_ppClutchModeCvar = (unsigned char **)(printResult.Start + 0x1e + 7 + ReadRel32(printResult.Start + 0x21));
+			g_OfsClutchModeValue = *(unsigned char *)(printResult.Start + 0x28);
+		}
+	}
+
+	// Chat sound helper: ... params = { "HudChat.Message", ... }; EmitSound(-1, &params)
+	{
+		Afx::BinUtils::MemRange sndResult = Afx::BinUtils::FindPatternString(textRange,
+			"33 C0 48 C7 44 24 34 00 00 80 3F 48 89 44 24 40 48 8D 54 24 20 B8 64 00 00 00 C7 44 24 3C FF FF FF FF 66 89 44 24 48 "
+			"B9 FF FF FF FF 0F B6 44 24 4A 24 E1 0C 01 88 44 24 4A 48 8D 05 ?? ?? ?? ?? 48 89 44 24 20 E8");
+		if (!sndResult.IsEmpty() && 0 == strcmp((const char *)(sndResult.Start + 0x39 + 7 + ReadRel32(sndResult.Start + 0x3c)), "HudChat.Message")) {
+			g_EmitSound = (EmitSound_t)(sndResult.Start + 0x45 + 5 + ReadRel32(sndResult.Start + 0x46));
+		} else advancedfx::Warning("mirv_pov: chat sound not found (radio lines without sound).\n");
+	}
+
 	// "spec_target_updated" sender (CCSObserver_ObserverServices): event = CreateEvent(..); SetPlayer("userid", pawn);
 	// mov rdi, [rcx+SetEntity] (+0xbf); ...; SetEntity("target", GetObserverTarget())
 	{
@@ -1206,6 +1261,8 @@ void MirvPov_HookEngine2Dll(HMODULE engine2Dll) {
 	}
 }
 
+static void ChatLines_OnFrame();
+
 void MirvPov_BeforeFrameStageNotify(int curStage) {
 	SetScoreboardPatch(0 != g_HltvSpoofMode && nullptr != g_KillCamLastSwapped && 0 == g_KillCamSuspendFrames);
 
@@ -1218,7 +1275,10 @@ void MirvPov_BeforeFrameStageNotify(int curStage) {
 	}
 	KillCam_Apply(false);
 	if (g_PovSuppressBuyMenu && nullptr != g_KillCamLastSwapped) SuppressTargetBuyMenu();
-	if (SOURCESDK::CS2::FRAME_RENDER_PASS == curStage) DamageReport_OnFrame();
+	if (SOURCESDK::CS2::FRAME_RENDER_PASS == curStage) {
+		DamageReport_OnFrame();
+		ChatLines_OnFrame();
+	}
 
 	// After a (re-)swap: undo the predictability the game just gave the target's entities.
 	static void * s_pPredictClearedFor = nullptr;
@@ -1369,6 +1429,247 @@ static void DamageArcs_OnHurt(SOURCESDK::CS2::IGameEvent * pEvent) {
 }
 
 // Must not contain objects with destructors (SEH).
+static const char * Localize(const char * pszToken) {
+	if (nullptr == g_ppLocalize || g_LocalizeFindIndex < 0) return nullptr;
+	__try {
+		void * pLocalize = *g_ppLocalize;
+		if (nullptr == pLocalize) return nullptr;
+		return ((Localize_Find_t)(*(void ***)pLocalize)[g_LocalizeFindIndex])(pLocalize, pszToken);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return nullptr;
+	}
+}
+
+static const char * LocalizeOr(const char * pszToken, const char * pszFallback) {
+	const char * pszResult = Localize(pszToken);
+	return nullptr != pszResult ? pszResult : pszFallback;
+}
+
+// Replaces %s1 .. %s9 in pszFormat (like ILocalize::ConstructString).
+static void FormatLocalized(char * pOut, size_t outSize, const char * pszFormat, const char * const * params, int count) {
+	size_t len = 0;
+	for (const char * p = pszFormat; '\0' != *p && len + 1 < outSize; ++p) {
+		if ('%' == p[0] && 's' == p[1] && '1' <= p[2] && p[2] <= '9') {
+			int index = p[2] - '1';
+			const char * pszParam = index < count && nullptr != params[index] ? params[index] : "";
+			for (; '\0' != *pszParam && len + 1 < outSize; ++pszParam) pOut[len++] = *pszParam;
+			p += 2;
+		} else pOut[len++] = *p;
+	}
+	pOut[len] = '\0';
+}
+
+// Must not contain objects with destructors (SEH).
+static void PrintChat(int nClient, const char * pszText) {
+	if (nullptr == g_ChatPrintf) return;
+	__try {
+		unsigned char filter[2] = { 0, 1 };
+		g_ChatPrintf(nullptr, filter, nClient, "%s", pszText); // this is unused
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		g_ChatPrintf = nullptr;
+	}
+}
+
+static const char * StripWeaponPrefix(const char * pszWeapon) {
+	if (nullptr == pszWeapon) return "";
+	return 0 == strncmp(pszWeapon, "weapon_", 7) ? pszWeapon + 7 : pszWeapon;
+}
+
+// Must not contain objects with destructors (SEH).
+static bool GetPlaceName(void * pPawn, char * pOut, size_t outSize) {
+	pOut[0] = '\0';
+	if (nullptr == pPawn || 0 == g_clientDllOffsets.C_CSPlayerPawn.m_szLastPlaceName) return false;
+	__try {
+		const char * pszPlace = (const char *)pPawn + g_clientDllOffsets.C_CSPlayerPawn.m_szLastPlaceName;
+		size_t i = 0;
+		for (; i + 1 < outSize && i < 18 && '\0' != pszPlace[i]; ++i) pOut[i] = pszPlace[i];
+		pOut[i] = '\0';
+		return 0 < i;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+// Must not contain objects with destructors (SEH).
+static void PlayChatSound() {
+	if (nullptr == g_EmitSound) return;
+	__try {
+		if (nullptr != g_ppClutchModeCvar && nullptr != *g_ppClutchModeCvar && 0 != *(*g_ppClutchModeCvar + g_OfsClutchModeValue)) return;
+		alignas(16) unsigned char params[0x40] = {};
+		*(const char **)params = "HudChat.Message";
+		*(float *)(params + 0x14) = 1.0f;
+		*(int *)(params + 0x1c) = -1;
+		*(unsigned short *)(params + 0x28) = 100;
+		params[0x2a] = 1;
+		g_EmitSound(-1, params);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		g_EmitSound = nullptr;
+	}
+}
+
+// Grenade radio, sent by the server to the thrower's team.
+static void ChatLines_OnWeaponFire(SOURCESDK::CS2::IGameEvent * pEvent) {
+	if (!g_PovChatRadio || nullptr == g_ChatPrintf || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames) return;
+	static const struct { const char * Weapon; const char * Token; } radios[] = {
+		{ "hegrenade", "#SFUI_TitlesTXT_Fire_in_the_hole" },
+		{ "flashbang", "#SFUI_TitlesTXT_Flashbang_in_the_hole" },
+		{ "smokegrenade", "#SFUI_TitlesTXT_Smoke_in_the_hole" },
+		{ "molotov", "#SFUI_TitlesTXT_Molotov_in_the_hole" },
+		{ "incgrenade", "#SFUI_TitlesTXT_Incendiary_in_the_hole" },
+		{ "decoy", "#SFUI_TitlesTXT_Decoy_in_the_hole" },
+	};
+	const char * pszWeapon = StripWeaponPrefix(GetGameEventString(pEvent, "weapon"));
+	const char * pszToken = nullptr;
+	for (const auto & radio : radios) if (0 == strcmp(pszWeapon, radio.Weapon)) { pszToken = radio.Token; break; }
+	if (nullptr == pszToken) return;
+
+	CEntityInstance * pThrower = (CEntityInstance *)GetGameEventPlayerController(pEvent, "userid");
+	if (nullptr == pThrower) return;
+	int team = pThrower->GetTeam();
+	if (team != ((CEntityInstance *)g_KillCamLastSwapped)->GetTeam()) return;
+	int thrower = GetEntityIndex(pThrower);
+
+	char prefixToken[40];
+	_snprintf_s(prefixToken, _TRUNCATE, "#game_radio_team_prefix_%i", team);
+	const char * pszPrefix = LocalizeOr(prefixToken, "");
+	const char * pszName = SafeName(pThrower->GetSanitizedPlayerName());
+	const char * pszText = LocalizeOr(pszToken, "Fire in the hole!");
+
+	char place[32];
+	char line[512];
+	if (GetPlaceName(GetTargetPlayerPawn(thrower), place, sizeof(place))) {
+		char placeToken[40];
+		_snprintf_s(placeToken, _TRUNCATE, "#%s", place);
+		const char * params[] = { pszName, LocalizeOr(placeToken, place), pszText, pszPrefix };
+		FormatLocalized(line, sizeof(line), LocalizeOr("#Game_radio_location", " %s4%s1 @ %s2: %s3"), params, 4);
+	} else {
+		const char * params[] = { pszName, pszText, "", pszPrefix };
+		FormatLocalized(line, sizeof(line), LocalizeOr("#Game_radio", " %s4%s1: %s2"), params, 4);
+	}
+	PrintChat(thrower - 1, line);
+	PlayChatSound();
+}
+
+// Kill rewards: queued on the target's kills, printed when their money changes (amount = change).
+struct ChatKill_t { int Tick; bool TeamKill; char Weapon[32]; };
+const int c_ChatMaxKills = 8;
+const int c_ChatKillTimeoutTicks = 32;
+ChatKill_t g_ChatKills[c_ChatMaxKills];
+int g_ChatKillCount = 0;
+int g_ChatLastAccount = -1; // target's money last frame, -1 = unknown
+void * g_ChatMoneyFor = nullptr;
+
+static void ChatLines_ResetMoney() {
+	g_ChatKillCount = 0;
+	g_ChatLastAccount = -1;
+}
+
+static void ChatLines_OnDeath(SOURCESDK::CS2::IGameEvent * pEvent) {
+	if (!g_PovChatMoney || nullptr == g_ChatPrintf || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames) return;
+	CEntityInstance * pAttacker = (CEntityInstance *)GetGameEventPlayerController(pEvent, "attacker");
+	CEntityInstance * pVictim = (CEntityInstance *)GetGameEventPlayerController(pEvent, "userid");
+	if (pAttacker != g_KillCamLastSwapped || nullptr == pVictim || pVictim == pAttacker || c_ChatMaxKills <= g_ChatKillCount) return;
+	ChatKill_t & kill = g_ChatKills[g_ChatKillCount++];
+	kill.Tick = GetDemoTick();
+	kill.TeamKill = pVictim->GetTeam() == pAttacker->GetTeam();
+	strncpy_s(kill.Weapon, StripWeaponPrefix(GetGameEventString(pEvent, "weapon")), _TRUNCATE);
+}
+
+static const char * WeaponNameToken(const char * pszWeapon) {
+	static const struct { const char * Weapon; const char * Token; } names[] = {
+		{ "ak47", "#SFUI_WPNHUD_AK47" }, { "aug", "#SFUI_WPNHUD_Aug" }, { "awp", "#SFUI_WPNHUD_AWP" },
+		{ "deagle", "#SFUI_WPNHUD_DesertEagle" }, { "elite", "#SFUI_WPNHUD_Elites" }, { "famas", "#SFUI_WPNHUD_Famas" },
+		{ "fiveseven", "#SFUI_WPNHUD_FiveSeven" }, { "g3sg1", "#SFUI_WPNHUD_G3SG1" }, { "galilar", "#SFUI_WPNHUD_GalilAR" },
+		{ "glock", "#SFUI_WPNHUD_Glock18" }, { "hkp2000", "#SFUI_WPNHUD_HKP2000" }, { "usp_silencer", "#SFUI_WPNHUD_USP_SILENCER" },
+		{ "m249", "#SFUI_WPNHUD_M249" }, { "m4a1", "#SFUI_WPNHUD_M4A1" }, { "m4a1_silencer", "#SFUI_WPNHUD_M4_SILENCER" },
+		{ "mac10", "#SFUI_WPNHUD_MAC10" }, { "mag7", "#SFUI_WPNHUD_Mag7" }, { "mp5sd", "#SFUI_WPNHUD_MP5SD" },
+		{ "mp7", "#SFUI_WPNHUD_MP7" }, { "mp9", "#SFUI_WPNHUD_MP9" }, { "negev", "#SFUI_WPNHUD_Negev" },
+		{ "nova", "#SFUI_WPNHUD_Nova" }, { "p250", "#SFUI_WPNHUD_P250" }, { "p90", "#SFUI_WPNHUD_P90" },
+		{ "bizon", "#SFUI_WPNHUD_Bizon" }, { "revolver", "#SFUI_WPNHUD_REVOLVER" }, { "sawedoff", "#SFUI_WPNHUD_Sawedoff" },
+		{ "scar20", "#SFUI_WPNHUD_SCAR20" }, { "sg556", "#SFUI_WPNHUD_SG556" }, { "ssg08", "#SFUI_WPNHUD_SSG08" },
+		{ "taser", "#SFUI_WPNHUD_Taser" }, { "tec9", "#SFUI_WPNHUD_Tec9" }, { "ump45", "#SFUI_WPNHUD_UMP45" },
+		{ "xm1014", "#SFUI_WPNHUD_xm1014" }, { "cz75a", "#SFUI_WPNHUD_CZ75" }, { "hegrenade", "#SFUI_WPNHUD_HE_Grenade" },
+		{ "inferno", "#SFUI_WPNHUD_Molotov" }, { "molotov", "#SFUI_WPNHUD_Molotov" }, { "incgrenade", "#SFUI_WPNHUD_IncGrenade" },
+		{ "flashbang", "#SFUI_WPNHUD_Flashbang" }, { "smokegrenade", "#SFUI_WPNHUD_SmokeGrenade" }, { "decoy", "#SFUI_WPNHUD_Decoy" },
+	};
+	for (const auto & name : names) if (0 == strcmp(pszWeapon, name.Weapon)) return name.Token;
+	if (0 == strncmp(pszWeapon, "knife", 5) || 0 == strncmp(pszWeapon, "bayonet", 7)) return "#SFUI_WPNHUD_Knife";
+	return nullptr;
+}
+
+static void ChatLines_PrintKill(const ChatKill_t & kill, int amount) {
+	char amountText[16];
+	_snprintf_s(amountText, _TRUNCATE, "%i", amount < 0 ? -amount : amount);
+	char line[512];
+	const char * pszWeaponToken = WeaponNameToken(kill.Weapon);
+	const char * pszWeaponName = nullptr != pszWeaponToken ? Localize(pszWeaponToken) : nullptr;
+	if (kill.TeamKill) {
+		const char * params[] = { amountText };
+		FormatLocalized(line, sizeof(line), LocalizeOr("#Player_Cash_Award_Kill_Teammate", " -$%s1 penalty for killing a friendly"), params, 1);
+	} else if (nullptr != pszWeaponName) {
+		const char * params[] = { amountText, pszWeaponName };
+		FormatLocalized(line, sizeof(line), LocalizeOr("#Player_Cash_Award_Killed_Enemy", " +$%s1 for neutralizing an enemy with the %s2"), params, 2);
+	} else {
+		const char * params[] = { amountText };
+		FormatLocalized(line, sizeof(line), LocalizeOr("#Player_Cash_Award_Killed_Enemy_Generic", " +$%s1 for neutralizing an enemy"), params, 1);
+	}
+	PrintChat(-1, line);
+}
+
+// Must not contain objects with destructors (SEH).
+static int GetAccount(void * pController) {
+	if (0 == g_clientDllOffsets.CCSPlayerController.m_pInGameMoneyServices || 0 == g_clientDllOffsets.CCSPlayerController_InGameMoneyServices.m_iAccount) return -1;
+	__try {
+		unsigned char * pServices = *(unsigned char **)((unsigned char *)pController + g_clientDllOffsets.CCSPlayerController.m_pInGameMoneyServices);
+		if (nullptr == pServices) return -1;
+		return *(int *)(pServices + g_clientDllOffsets.CCSPlayerController_InGameMoneyServices.m_iAccount);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return -1;
+	}
+}
+
+// Once per rendered frame (not while suspended).
+static void ChatLines_OnFrame() {
+	if (g_ChatMoneyFor != g_KillCamLastSwapped) {
+		g_ChatMoneyFor = g_KillCamLastSwapped;
+		ChatLines_ResetMoney();
+	}
+	if (nullptr == g_KillCamLastSwapped) return;
+	static int s_lastTick = -1;
+	int tick = GetDemoTick();
+	if (tick < s_lastTick) ChatLines_ResetMoney(); // seeked back
+	s_lastTick = tick;
+	int account = GetAccount(g_KillCamLastSwapped);
+	if (account < 0) return;
+	if (0 <= g_ChatLastAccount && account != g_ChatLastAccount && 0 < g_ChatKillCount) {
+		int delta = account - g_ChatLastAccount;
+		// Kill rewards add money, team kills cost it; anything else (buying) isn't for us.
+		bool bTeamKill = g_ChatKills[0].TeamKill;
+		if (bTeamKill ? delta < 0 : 0 < delta) {
+			int count = 0;
+			for (int i = 0; i < g_ChatKillCount; ++i) if (g_ChatKills[i].TeamKill == bTeamKill) ++count;
+			for (int i = 0; i < g_ChatKillCount; ++i) if (g_ChatKills[i].TeamKill == bTeamKill) ChatLines_PrintKill(g_ChatKills[i], delta / count);
+			int kept = 0;
+			for (int i = 0; i < g_ChatKillCount; ++i) if (g_ChatKills[i].TeamKill != bTeamKill) g_ChatKills[kept++] = g_ChatKills[i];
+			g_ChatKillCount = kept;
+		}
+	}
+	g_ChatLastAccount = account;
+	// No money change (e.g. at max money): no line.
+	int kept = 0;
+	for (int i = 0; i < g_ChatKillCount; ++i) {
+		if (0 <= tick && g_ChatKills[i].Tick + c_ChatKillTimeoutTicks < tick) continue;
+		g_ChatKills[kept++] = g_ChatKills[i];
+	}
+	g_ChatKillCount = kept;
+}
+
+// Must not contain objects with destructors (SEH).
 static bool ShowDeathCard() {
 	__try {
 		void * pElement = g_FindHudElement("CCSGO_HudDeathPanel");
@@ -1398,6 +1699,13 @@ bool MirvPov_BeforeClientGameEvent(SOURCESDK::CS2::IGameEvent * pEvent) {
 		FixSpecTargetEvent(pEvent);
 		return false;
 	}
+
+	if (0 == strcmp(pszName, "weapon_fire")) {
+		ChatLines_OnWeaponFire(pEvent);
+		return false;
+	}
+
+	if (0 == strcmp(pszName, "player_death")) ChatLines_OnDeath(pEvent);
 
 	if (!g_PovDeathCard || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames
 		|| nullptr == g_FindHudElement || nullptr == g_DeathPanel_SetPendingDamage) return false;
@@ -1574,6 +1882,18 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 			return;
 		}
 
+		if ((0 == _stricmp(cmd, "radio") || 0 == _stricmp(cmd, "killreward")) && 3 <= argc) {
+			if (nullptr == g_ChatPrintf) {
+				advancedfx::Warning("mirv_pov: chat print not found.\n");
+				return;
+			}
+			bool bOn = 0 != atoi(args->ArgV(2));
+			if (0 == _stricmp(cmd, "radio")) g_PovChatRadio = bOn;
+			else g_PovChatMoney = bOn;
+			advancedfx::Message("mirv_pov: %s chat lines %s.\n", 0 == _stricmp(cmd, "radio") ? "grenade radio" : "kill reward", bOn ? "on" : "off");
+			return;
+		}
+
 		if (0 == _stricmp(cmd, "spectarget") && 3 <= argc) {
 			if (g_GameEventSetEntityIndex < 0) {
 				advancedfx::Warning("mirv_pov: spec target fix not available.\n");
@@ -1618,10 +1938,12 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s deathcard <0|1> - Show the \"killed you with\" death card (default 1).\n"
 		"%s damagereport <0|1|show> - Round end damage report under the avatars (default 1), show = now, with what's collected so far.\n"
 		"%s damagearcs <0|1> - Damage direction arcs when the player gets hit (default 1).\n"
-		"%s spectarget <0|1> -Make the demo UI's spectated player (and its markers) the POV player, also while dead (default 1).\n"
+		"%s radio <0|1> - Grenade radio chat lines of the player's team (default 1).\n"
+		"%s killreward <0|1> - Kill reward chat lines (default 1).\n"
+		"%s spectarget <0|1> - Make the demo UI's spectated player (and its markers) the POV player, also while dead (default 1).\n"
 		"%s chatlog <0|1> - Log chat (SayText2) messages arriving at the chat HUD.\n"
 		"%s hltvlog [0|1] - IsHLTV() caller logging on (resets) / off, without argument prints the callers.\n"
 		"%s diag <0|1> - Diagnostic logging to console and %%TEMP%%\\mirv_pov_log.txt (default 0).\n"
-		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
+		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
 	);
 }

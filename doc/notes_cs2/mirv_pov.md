@@ -33,6 +33,9 @@ follow the POV player, also when seeking to a moment where they're dead.
   you've already watched is fine. If you skip part of a round by seeking forward, the report
   misses what you skipped.
 - Chat, if the demo contains readable chat.
+- Grenade radio lines of the player's team ("[CT] Name﹫Place: Flashbang!") and the player's
+  kill reward lines (" +$300 for neutralizing an enemy with the AK-47"), rebuilt from the demo.
+  Radio lines play the chat sound (not with `cl_clutch_mode 1`).
 
 ## Known limitations
 
@@ -43,7 +46,11 @@ follow the POV player, also when seeking to a moment where they're dead.
   in-game Watch UI, and team chat never does.
 - **Damage direction arcs** point at the attacker, also for grenade and fire damage (the
   real game points at the grenade / fire).
-- **Not recorded in GOTV demos, so not shown:** flash/HE ringing, HE screen shake, radio texts and kill-reward ("+$300") chat lines.
+- **Not recorded in GOTV demos, so not shown:** flash/HE ringing, HE
+  screen shake, and other radio / money chat lines (radio commands, round end team income,
+  bomb plant reward).
+- **Kill reward lines** take the amount from the player's money change, so there's no line
+  when it doesn't change (e.g. at max money).
 
 ## Advanced switches (`mirv_pov_debug`)
 
@@ -55,6 +62,8 @@ follow the POV player, also when seeking to a moment where they're dead.
 | `predict 0\|1` | 0 | 1 lets the game predict the player's pawn (game default) |
 | `deathcard 0\|1` | 1 | Show the death card |
 | `damagearcs 0\|1` | 1 | Damage direction arcs |
+| `radio 0\|1` | 1 | Grenade radio chat lines |
+| `killreward 0\|1` | 1 | Kill reward chat lines |
 | `damagereport 0\|1\|show` | 1 | Round end damage report; `show` = now, with what's collected so far |
 | `spectarget 0\|1` | 1 | Demo UI's spectated player = POV player (also while dead) |
 | `chatlog 0\|1` | 0 | Log chat messages arriving at the chat HUD |
@@ -79,6 +88,7 @@ Tested in game on a Valve MM demo and a pro tournament demo.
 | Round end damage report | Working when played through; some inconsistencies after seeks |
 | Demo UI spectated player / markers | Working; some inconsistencies after seeks |
 | Chat | Working where readable (MM demo chat is encrypted) |
+| Grenade radio and kill reward chat lines | Working; chat sound not tested in game yet |
 | AWP/SSG scope blur | Broken (parked) |
 
 ## TODO / next steps
@@ -92,7 +102,8 @@ Missing / to fix:
       Could fill it by reading the demo's events ahead, or by noting the gap.
 - [ ] **Damage direction arcs, grenade / fire damage:** use the grenade or inferno position
       instead of the attacker's.
-- [ ] **Chat lines:** kill reward ("+$300"), radio texts.
+- [ ] **Chat lines:** test the radio chat sound. Still missing: round end team
+      income, bomb plant / defuse reward, radio commands (not in demos at all).
 - [ ] **Flash / HE ear ringing and HE screen shake.**
 - [ ] **AWP/SSG scope blur:** the local player's `m_vClientScopeInaccuracy` interpolation
       ignores the recording (see `mirv_pov_spike.md`).

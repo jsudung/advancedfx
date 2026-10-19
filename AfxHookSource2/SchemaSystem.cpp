@@ -125,6 +125,9 @@ void initSchemaSystemOffsets()
 	getOffset(&g_clientDllOffsets.C_CSPlayerPawn.m_bIsBuyMenuOpen, "client.dll", "C_CSPlayerPawn", "m_bIsBuyMenuOpen");
 	getOffset(&g_clientDllOffsets.CCSPlayerController.m_szCrosshairCodes, "client.dll", "CCSPlayerController", "m_szCrosshairCodes");
 	getOffset(&g_clientDllOffsets.CCSPlayerController.m_hPlayerPawn, "client.dll", "CCSPlayerController", "m_hPlayerPawn");
+	getOffset(&g_clientDllOffsets.CCSPlayerController.m_pInGameMoneyServices, "client.dll", "CCSPlayerController", "m_pInGameMoneyServices");
+	getOffset(&g_clientDllOffsets.CCSPlayerController_InGameMoneyServices.m_iAccount, "client.dll", "CCSPlayerController_InGameMoneyServices", "m_iAccount");
+	getOffset(&g_clientDllOffsets.C_CSPlayerPawn.m_szLastPlaceName, "client.dll", "C_CSPlayerPawn", "m_szLastPlaceName");
 }
 
 void HookSchemaSystem(HMODULE schemaSystemDll)
