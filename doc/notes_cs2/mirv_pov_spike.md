@@ -394,6 +394,27 @@ The radio chat sound: the RadioText handler plays `HudChat.Message` through
 `EmitSound(-1, &params)` (~0xc09410) unless `cl_clutch_mode`. We do the same after our radio
 lines.
 
+### Spectator x-ray after seeks
+
+Seen in game: after a seek, while swapped, every player glowed through walls (spectator x-ray).
+It went off when someone died and came back with the next seek.
+
+Player glow colour comes from a pawn virtual (~0xc7d380). It returns no glow for an alive
+local player, otherwise team colour for everyone when "spectator tools" are on (~0xce2420),
+else teammates only. Spectator tools are `force_spectator_only_tools ||
+(local->m_bIsLocalPlayerController (+0x790) ? cached g_bIsHLTV : local->m_bIsHLTV (+0x6f0)) ||
+<local pawn's controller / game mode checks>`.
+
+The glow isn't recomputed every frame, only on events (a listener for `player_death`,
+`player_spawn`, `spec_target_updated`, `round_start`, ...). Our seek resume invalidates the
+observer's spec target cache during the paused frames, while the GOTV controller is local
+again. So `spec_target_updated` refreshes the glow as a spectator, and that state stays until
+the next death.
+
+Fix: the spectator tools check is detoured to return false whenever a POV target is set (also
+while paused). `mirv_pov 0` invalidates the spec target cache once more, so the refresh brings
+x-ray back for normal spectating. `mirv_pov info` prints the check's inputs.
+
 ## Packaged as mirv_pov
 
 The spike was packaged as `mirv_pov <idx> | 0 | list | info` (code: `AfxHookSource2/MirvPov.*`),

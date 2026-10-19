@@ -66,6 +66,7 @@ follow the POV player, also when seeking to a moment where they're dead.
 | `radio 0\|1` | 1 | Grenade radio chat lines |
 | `killreward 0\|1` | 1 | Kill reward chat lines |
 | `enemyradio 0\|1` | 0 | 1 keeps the enemy team's radio voice lines audible |
+| `spectools 0\|1` | 0 | 1 allows spectator tools (x-ray) while in POV |
 | `damagereport 0\|1\|show` | 1 | Round end damage report; `show` = now, with what's collected so far |
 | `spectarget 0\|1` | 1 | Demo UI's spectated player = POV player (also while dead) |
 | `chatlog 0\|1` | 0 | Log chat messages arriving at the chat HUD |
@@ -92,6 +93,7 @@ Tested in game on a Valve MM demo and a pro tournament demo.
 | Chat | Working where readable (MM demo chat is encrypted) |
 | Grenade radio and kill reward chat lines | Working (incl. chat sound) |
 | Enemy radio voice muted | Working |
+| No spectator x-ray in POV | Working |
 | AWP/SSG scope blur | Broken (parked) |
 
 ## TODO / next steps

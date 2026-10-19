@@ -135,6 +135,23 @@ volatile bool g_MuteVoActive = false;
 volatile long g_MuteVoCount = 0; // diagnostics
 bool g_PovMuteEnemyRadio = true;
 
+// Spectator tools (x-ray: every player glows through walls in team colour, ...) are on when
+//   force_spectator_only_tools || (local->m_bIsLocalPlayerController ? g_bIsHLTV : local->m_bIsHLTV) || <pawn / game mode checks>
+// (local = GetSplitScreenPlayer(0)). Player glow isn't decided every frame but refreshed on events
+// (player_death, spec_target_updated, ...). After a seek we make spec_target_updated fire while the
+// swap is paused (GOTV again), so x-ray got latched on until the next death. So we return false
+// whenever a POV target is set, also while paused. The original's inputs are kept for mirv_pov info.
+typedef bool (__fastcall * SpectatorToolsEnabled_t)();
+SpectatorToolsEnabled_t g_Org_SpectatorToolsEnabled = nullptr;
+unsigned char ** g_ppForceSpectatorToolsCvar = nullptr;
+ptrdiff_t g_OfsForceSpectatorToolsValue = 0;
+ptrdiff_t g_OfsControllerIsHltv = 0; // CBasePlayerController::m_bIsHLTV
+unsigned char * g_pCachedIsHltv = nullptr; // what FrameStageNotify cached from IsHLTV()
+bool g_PovNoSpectatorTools = true;
+volatile bool g_SpecToolsLastOriginal = false;
+volatile long g_SpecToolsBlocked = 0;
+bool __fastcall New_SpectatorToolsEnabled(); // after the killcam state
+
 const char * __fastcall New_SosStartSoundEvent_Parse(void * pMsg, const char * ptr, void * pCtx) {
 	const char * pResult = g_Org_SosStartSoundEvent_Parse(pMsg, ptr, pCtx);
 	if (g_MuteVoActive && nullptr != pResult) {
@@ -305,6 +322,16 @@ const int c_KillCamSpecFrames = 8; // pause before swapping, so spec_player can 
 const int c_KillCamSeekTailFrames = 4; // after the seek target tick was reached
 int g_KillCamSuspendFrames = 0;
 int g_KillCamSeekTargetTick = -1;
+
+bool __fastcall New_SpectatorToolsEnabled() {
+	bool bResult = g_Org_SpectatorToolsEnabled();
+	g_SpecToolsLastOriginal = bResult;
+	if (bResult && g_PovNoSpectatorTools && 0 != g_KillCamTarget) {
+		InterlockedIncrement(&g_SpecToolsBlocked);
+		return false;
+	}
+	return bResult;
+}
 
 int32_t ReadRel32(size_t addr) { return *(int32_t *)addr; }
 
@@ -941,6 +968,19 @@ void PrintInfo() {
 			(unsigned long long)g_clientDllOffsets.CCSPlayerController.m_pInGameMoneyServices,
 			(unsigned long long)g_clientDllOffsets.CCSPlayerController_InGameMoneyServices.m_iAccount,
 			(unsigned long long)g_clientDllOffsets.C_CSPlayerPawn.m_szLastPlaceName);
+		{
+			int forceTools = -1, localIsLocal = -1, localIsHltv = -1, cachedHltv = -1;
+			void * pLocal = GetLocalPlayerController();
+			if (nullptr != g_ppForceSpectatorToolsCvar && nullptr != *g_ppForceSpectatorToolsCvar) forceTools = *(*g_ppForceSpectatorToolsCvar + g_OfsForceSpectatorToolsValue) ? 1 : 0;
+			if (nullptr != pLocal) {
+				localIsLocal = *IsLocalPlayerControllerPtr(pLocal) ? 1 : 0;
+				if (0 != g_OfsControllerIsHltv) localIsHltv = *((unsigned char *)pLocal + g_OfsControllerIsHltv) ? 1 : 0;
+			}
+			if (nullptr != g_pCachedIsHltv) cachedHltv = *g_pCachedIsHltv ? 1 : 0;
+			InfoPrintf("Spectator tools (x-ray): hook %s, blocking %i, original last %i, blocked so far %li | force_spectator_only_tools %i, local %i: m_bIsLocalPlayerController %i, m_bIsHLTV %i, cached IsHLTV %i\n",
+				nullptr != g_Org_SpectatorToolsEnabled ? "OK" : "MISSING", g_PovNoSpectatorTools ? 1 : 0, g_SpecToolsLastOriginal ? 1 : 0, g_SpecToolsBlocked,
+				forceTools, GetEntityIndex(pLocal), localIsLocal, localIsHltv, cachedHltv);
+		}
 		InfoPrintf("Chat sound: %s | enemy radio mute: hook %s, on %i, active %i, muted so far %li (hash +0x%llx, source +0x%llx)\n",
 			nullptr != g_EmitSound ? "OK" : "MISSING", nullptr != g_Org_SosStartSoundEvent_Parse ? "OK" : "MISSING",
 			g_PovMuteEnemyRadio ? 1 : 0, g_MuteVoActive ? 1 : 0, g_MuteVoCount,
@@ -1216,6 +1256,30 @@ void MirvPov_HookClientDll(HMODULE clientDll) {
 		if (!sndResult.IsEmpty() && 0 == strcmp((const char *)(sndResult.Start + 0x39 + 7 + ReadRel32(sndResult.Start + 0x3c)), "HudChat.Message")) {
 			g_EmitSound = (EmitSound_t)(sndResult.Start + 0x45 + 5 + ReadRel32(sndResult.Start + 0x46));
 		} else advancedfx::Warning("mirv_pov: chat sound not found (radio lines without sound).\n");
+	}
+
+	// Spectator tools check: push rbx; ...; mov rax, [force_spectator_only_tools]; cmp byte ptr [rax+value], 0; jne true;
+	// local = GetSplitScreenPlayer(0); cmp byte ptr [local+m_bIsLocalPlayerController], 0; je; movzx eax, [g_bIsHLTV]; jmp; movzx eax, [local+m_bIsHLTV]
+	{
+		Afx::BinUtils::MemRange stResult = Afx::BinUtils::FindPatternString(textRange,
+			"40 53 48 83 EC 20 48 8B 05 ?? ?? ?? ?? 80 78 ?? 00 0F 85 ?? ?? ?? ?? 33 C9 E8 ?? ?? ?? ?? 48 8B D8 48 85 C0 74 ?? "
+			"80 B8 ?? ?? ?? ?? 00 74 ?? 0F B6 05 ?? ?? ?? ?? EB ?? 0F B6 80");
+		size_t flagFromFsn = 0 != g_Client.FrameStageNotifyIsHltvRetAddr
+			? g_Client.FrameStageNotifyIsHltvRetAddr + 3 + 6 + ReadRel32(g_Client.FrameStageNotifyIsHltvRetAddr + 5) : 0;
+		if (!stResult.IsEmpty() && stResult.Start + 0x2f + 7 + ReadRel32(stResult.Start + 0x32) == flagFromFsn) {
+			g_ppForceSpectatorToolsCvar = (unsigned char **)(stResult.Start + 6 + 7 + ReadRel32(stResult.Start + 9));
+			g_OfsForceSpectatorToolsValue = *(unsigned char *)(stResult.Start + 0x10);
+			g_OfsControllerIsHltv = ReadRel32(stResult.Start + 0x3b);
+			g_pCachedIsHltv = (unsigned char *)flagFromFsn;
+			g_Org_SpectatorToolsEnabled = (SpectatorToolsEnabled_t)stResult.Start;
+			DetourTransactionBegin();
+			DetourUpdateThread(GetCurrentThread());
+			DetourAttach(&(PVOID &)g_Org_SpectatorToolsEnabled, New_SpectatorToolsEnabled);
+			if (NO_ERROR != DetourTransactionCommit()) {
+				g_Org_SpectatorToolsEnabled = nullptr;
+				advancedfx::Warning("mirv_pov: failed to detour the spectator tools check.\n");
+			}
+		} else advancedfx::Warning("mirv_pov: spectator tools check not found (x-ray may show in POV).\n");
 	}
 
 	// CMsgSosStartSoundEvent: vtable[9] = _InternalParse, vtable[11] = _InternalSerialize, whose
@@ -1870,7 +1934,10 @@ static void MirvPov_SetTarget(int target) {
 		g_KillCamTarget = 0;
 		g_KillCamLastSwapped = nullptr;
 		g_KillCamSuspendFrames = 0;
-		if (KillCam_Restore()) advancedfx::Message("mirv_pov: off.\n");
+		if (KillCam_Restore()) {
+			InvalidateSpecTargetCache(); // spec_target_updated also refreshes player glow (spectator x-ray back on)
+			advancedfx::Message("mirv_pov: off.\n");
+		}
 		else advancedfx::Warning("mirv_pov: restore failed, local player controller is %i.\n", GetEntityIndex(GetLocalPlayerController()));
 	}
 }
@@ -1977,6 +2044,16 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 			return;
 		}
 
+		if (0 == _stricmp(cmd, "spectools") && 3 <= argc) {
+			if (nullptr == g_Org_SpectatorToolsEnabled) {
+				advancedfx::Warning("mirv_pov: spectator tools hook not installed.\n");
+				return;
+			}
+			g_PovNoSpectatorTools = 0 == atoi(args->ArgV(2));
+			advancedfx::Message("mirv_pov: spectator tools (x-ray) while in POV %s.\n", g_PovNoSpectatorTools ? "blocked" : "allowed");
+			return;
+		}
+
 		if (0 == _stricmp(cmd, "enemyradio") && 3 <= argc) {
 			if (nullptr == g_Org_SosStartSoundEvent_Parse) {
 				advancedfx::Warning("mirv_pov: sound event hook not installed.\n");
@@ -2045,11 +2122,12 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s damagearcs <0|1> - Damage direction arcs when the player gets hit (default 1).\n"
 		"%s radio <0|1> - Grenade radio chat lines of the player's team (default 1).\n"
 		"%s killreward <0|1> - Kill reward chat lines (default 1).\n"
-		"%s enemyradio <0|1> - 1 keeps the enemy team's radio voice lines audible (default 0, muted like for a player).\n"
+		"%s spectools <0|1> - 1 allows spectator tools like x-ray while in POV (default 0).\n"
+		"%s enemyradio <0|1> -1 keeps the enemy team's radio voice lines audible (default 0, muted like for a player).\n"
 		"%s spectarget <0|1> - Make the demo UI's spectated player (and its markers) the POV player, also while dead (default 1).\n"
 		"%s chatlog <0|1> - Log chat (SayText2) messages arriving at the chat HUD.\n"
 		"%s hltvlog [0|1] - IsHLTV() caller logging on (resets) / off, without argument prints the callers.\n"
 		"%s diag <0|1> - Diagnostic logging to console and %%TEMP%%\\mirv_pov_log.txt (default 0).\n"
-		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
+		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
 	);
 }
