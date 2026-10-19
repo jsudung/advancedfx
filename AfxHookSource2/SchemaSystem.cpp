@@ -121,6 +121,9 @@ void initSchemaSystemOffsets()
 
 	// Optional (mirv_pov), no error if missing:
 	getOffset(&g_clientDllOffsets.C_CSGameRules.m_totalRoundsPlayed, "client.dll", "C_CSGameRules", "m_totalRoundsPlayed");
+	getOffset(&g_clientDllOffsets.C_CSGameRules.m_eRoundWinReason, "client.dll", "C_CSGameRules", "m_eRoundWinReason");
+	getOffset(&g_clientDllOffsets.C_CSGameRules.m_iNumConsecutiveCTLoses, "client.dll", "C_CSGameRules", "m_iNumConsecutiveCTLoses");
+	getOffset(&g_clientDllOffsets.C_CSGameRules.m_iNumConsecutiveTerroristLoses, "client.dll", "C_CSGameRules", "m_iNumConsecutiveTerroristLoses");
 	getOffset(&g_clientDllOffsets.C_BaseEntity.m_fFlags, "client.dll", "C_BaseEntity", "m_fFlags");
 	getOffset(&g_clientDllOffsets.CBasePlayerController.m_bIsLocalPlayerController, "client.dll", "CBasePlayerController", "m_bIsLocalPlayerController");
 	getOffset(&g_clientDllOffsets.C_CSPlayerPawn.m_bIsBuyMenuOpen, "client.dll", "C_CSPlayerPawn", "m_bIsBuyMenuOpen");

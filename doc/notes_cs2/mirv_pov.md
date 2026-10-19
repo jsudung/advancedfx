@@ -36,6 +36,11 @@ follow the POV player, also when seeking to a moment where they're dead.
 - Grenade radio lines of the player's team ("[CT] Name﹫Place: Flashbang!") and the player's
   kill reward lines (" +$300 for neutralizing an enemy with the AK-47"), rebuilt from the demo.
   Radio lines play the chat sound (not with `cl_clutch_mode 1`).
+- The player's money lines: C4 plant / defuse rewards and the round end team income (win
+  reason, loss bonus, planted-bomb bonus, CTs' $50 per eliminated terrorist, no income for Ts
+  alive when time runs out). Like in the real game, team income shows right at the round end,
+  the CT "eliminated terrorists" line at the next round start, and no team income lines on the
+  last round of a half or the match.
 - Only the player's own team's radio voice lines are heard (GOTV demos have both teams').
 - Ear ringing (with the muffling) after flashbangs and big HE hits, and the C4 explosion screen
   shake, like the server does for players. Grenades don't shake the screen in CS2.
@@ -49,10 +54,11 @@ follow the POV player, also when seeking to a moment where they're dead.
   in-game Watch UI, and team chat never does.
 - **Damage direction arcs** point at the attacker, also for grenade and fire damage (the
   real game points at the grenade / fire).
-- **Not recorded in GOTV demos, so not shown:** other radio / money chat lines (radio commands, round end team income,
-  bomb plant reward).
-- **Kill reward lines** take the amount from the player's money change, so there's no line
-  when it doesn't change (e.g. at max money).
+- **Not recorded in GOTV demos, so not shown:** radio command lines ("Enemy spotted", ...).
+- **Money lines:** kill rewards come from the player's money change, so there's no kill line
+  when the money doesn't change (e.g. at max money). Team income amounts are computed from the
+  round result and the server's money convars (the demo's replicated values, else CS2's
+  defaults).
 
 ## Advanced switches (`mirv_pov_debug`)
 
@@ -65,7 +71,7 @@ follow the POV player, also when seeking to a moment where they're dead.
 | `deathcard 0\|1` | 1 | Show the death card |
 | `damagearcs 0\|1` | 1 | Damage direction arcs |
 | `radio 0\|1` | 1 | Grenade radio chat lines |
-| `killreward 0\|1` | 1 | Kill reward chat lines |
+| `killreward 0\|1` | 1 | Money chat lines (kill, plant / defuse, team income) |
 | `enemyradio 0\|1` | 0 | 1 keeps the enemy team's radio voice lines audible |
 | `spectools 0\|1` | 0 | 1 allows spectator tools (x-ray) while in POV |
 | `bombshake 0\|1` | 1 | C4 explosion screen shake |
@@ -95,6 +101,7 @@ Tested in game on a Valve MM demo and a pro tournament demo.
 | Demo UI spectated player / markers | Working; some inconsistencies after seeks |
 | Chat | Working where readable (MM demo chat is encrypted) |
 | Grenade radio and kill reward chat lines | Working (incl. chat sound) |
+| Plant / defuse and team income chat lines | Working (verified against a money log) |
 | Enemy radio voice muted | Working |
 | No spectator x-ray in POV | Working |
 | Flash / HE ear ringing, C4 screen shake | Working |
@@ -111,8 +118,6 @@ Missing / to fix:
       Could fill it by reading the demo's events ahead, or by noting the gap.
 - [ ] **Damage direction arcs, grenade / fire damage:** use the grenade or inferno position
       instead of the attacker's.
-- [ ] **Chat lines:** still missing: round end team
-      income, bomb plant / defuse reward, radio commands (not in demos at all).
 - [ ] **AWP/SSG scope blur:** the local player's `m_vClientScopeInaccuracy` interpolation
       ignores the recording (see `mirv_pov_spike.md`).
 - [ ] **Old `CSGO-` v1 crosshair codes:** convert to the new format before applying.

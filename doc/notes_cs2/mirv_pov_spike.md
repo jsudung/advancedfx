@@ -464,6 +464,88 @@ What we do:
 - On `bomb_exploded`: if the target pawn is on the ground (`m_fFlags & FL_ONGROUND`), shake
   with the falloff from the `C_PlantedC4` entity.
 
+### Plant / defuse rewards and team income
+
+From server.dll:
+
+- `CCSGameRules::AddTeamAccount(team, awardType, amount, customMsg)` (~0x906380). For each
+  player of the team that receives income, it adds the money and prints
+  `#Team_Cash_Award_<type>` with the amount. Players that don't receive income get
+  `#Team_Cash_Award_No_Income` (or `_Suicide`). Nothing is printed on the last round of a half
+  or match, because money resets.
+- Award types:
+
+  | Type | Token |
+  |---|---|
+  | 1 | `T_Win_Bomb` |
+  | 2-3 | `Elim_Hostage` |
+  | 4 | `Elim_Bomb` |
+  | 5-6 | `Win_Time` |
+  | 7 | `Win_Defuse_Bomb` |
+  | 8 | `Win_Hostage(s)_Rescue` |
+  | 9 | `Loser_Bonus` (`_Neg` if <= 0) |
+  | 13 | `Planted_Bomb_But_Defused` |
+  | 18 | `Bonus_Shorthanded` |
+
+  Round end awards are queued and paid by the queue processor (~0x954ad0, from
+  `CCSGameRules::Think`). The processor computes the loss bonus (~0x90b2c0) as
+  `cash_team_loser_bonus + cash_team_loser_bonus_consecutive_rounds * min(losses,
+  mp_consecutive_loss_max)`, using the counter from before this round, then updates
+  `m_iNumConsecutive{CT,Terrorist}Loses` (the winner's goes down by one, depending on a mode
+  convar). A static read suggested this happens at the next round start, but a diag log of a
+  demo shows otherwise. The money, the win status, `m_totalRoundsPlayed` and the updated loss
+  counters all change in the same frame at the round end. Only the CT dead enemies award comes
+  later (about 430 ticks, just before the win status goes back to 0).
+- Per dead enemy (award type 19, ~0x94ce90, at `cs_pre_restart`, game type classic with mode
+  competitive / wingman / ...): always for the CT team (won or lost). The amount is
+  `cash_team_per_dead_enemy` (50) times the number of dead Ts. Text:
+  `#Team_Cash_Award_Dead_Terrorists:f` = " +$%s1 team income for {num_enemies} eliminated
+  {num_enemies, plural, one{terrorist} other{terrorists}}" (ICU plural, resolved by us).
+- Personal awards (~0xaf8920, `#Player_Cash_Award_*`) are always printed, also on the last round
+  of a half. Only the team income in AddTeamAccount is skipped there.
+- Round end reasons (TerminateRound notice table): 1 bombed, 7 defused, 8 CTs win,
+  9 Ts win, 11 hostages rescued, 12 target saved, 13 hostages not rescued, ...
+- Defaults:
+
+  | Award | Amount |
+  |---|---|
+  | `cash_team_terrorist_win_bomb` | 3500 |
+  | `cash_team_elimination_bomb_map` | 3250 |
+  | `cash_team_win_by_time_running_out_bomb` | 3250 |
+  | `cash_team_win_by_defusing_bomb` | 3250 |
+  | `cash_team_win_by_hostage_rescue` | 3500 |
+  | `cash_team_loser_bonus` | 1400 (+500 per consecutive loss) |
+  | `cash_team_planted_bomb_but_defused` | 600 |
+  | `cash_player_bomb_planted` / `_defused` | 300 |
+
+What we do (the user's in-game experience: team income at the round end, the CT dead
+enemies line at the next round start):
+
+- Plant and defuse are personal awards queued on `bomb_planted` / `bomb_defused` by the
+  target. They're printed with the money change as the fixed `cash_player_bomb_planted` /
+  `_defused` (300), even when the money is capped. (A first version gave the whole change to
+  the defuse and printed "+$550".)
+- At the round end (win status 0 -> 2/3), the team income lines are printed right away. The
+  amount is computed like AddTeamAccount does:
+  - Winner: the `cash_team_*` value for `m_eRoundWinReason`.
+  - Loser: `cash_team_loser_bonus + cash_team_loser_bonus_consecutive_rounds * min(losses,
+    mp_consecutive_loss_max)`. The losses are `m_iNumConsecutive{CT,Terrorist}Loses - 1`: the
+    client gets the already incremented count in the same frame as the round end. Teams start
+    at 1, so losing the pistol round pays 1900.
+  - Ts after a defuse also get `Planted_Bomb_But_Defused`. Ts alive when time ran out get
+    `No_Income` instead.
+
+  Convars are read with `g_pCVar->FindConVar` (the `mp_*` ones are replicated). Server
+  defaults are used as fallback.
+- Nothing is printed on the last round of a half or the match: `m_gamePhase` is 4/5, or
+  `m_totalRoundsPlayed` (already counting this round) is `mp_maxrounds / 2` (with
+  `mp_halftime`), `mp_maxrounds`, or the end of an overtime half (`mp_overtime_maxrounds / 2`).
+- CT target: dead Ts are counted while the round is over, and the dead enemies line
+  (`cash_team_per_dead_enemy` x count) is printed when the win status goes back to 0.
+- The team money arrives later and is absorbed without a line: the printed amounts are
+  subtracted from the following increases until a while after the next round start. Kills in
+  the same change get the rest.
+
 ## Packaged as mirv_pov
 
 The spike was packaged as `mirv_pov <idx> | 0 | list | info` (code: `AfxHookSource2/MirvPov.*`),

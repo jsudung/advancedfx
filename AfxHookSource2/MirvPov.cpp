@@ -12,6 +12,8 @@
 
 #include "../deps/release/prop/cs2/sdk_src/public/cdll_int.h"
 #include "../deps/release/prop/cs2/sdk_src/public/igameevents.h"
+#include "../deps/release/prop/cs2/sdk_src/public/tier1/convar.h"
+#include "../deps/release/prop/cs2/sdk_src/public/icvar.h"
 
 extern SOURCESDK::CS2::ISource2EngineToClient * g_pEngineToClient;
 
@@ -24,6 +26,7 @@ extern SOURCESDK::CS2::ISource2EngineToClient * g_pEngineToClient;
 #include <cstdio>
 #include <intrin.h>
 #include <algorithm>
+#include <string>
 #include <vector>
 
 #pragma intrinsic(_ReturnAddress)
@@ -1916,8 +1919,19 @@ static void MuteRadio_OnFrame() {
 	g_MuteVoActive = bActive;
 }
 
-// Kill rewards: queued on the target's kills, printed when their money changes (amount = change).
-struct ChatKill_t { int Tick; bool TeamKill; char Weapon[32]; };
+// Money chat lines (CUserMessageTextMsg in the real game):
+// - Personal awards (kill, team kill penalty, C4 plant / defuse): queued on the target's events,
+//   printed when their money changes in the right direction (kills split if several share one
+//   change; plant / defuse always the fixed amount).
+// - Team income: printed right when the round ends (C_CSGameRules::m_iRoundWinStatus becomes the
+//   winner), with the amount the server's CCSGameRules::AddTeamAccount gives for the round end
+//   reason (cash_team_* convars; loss bonus from m_iNumConsecutive*Loses). The money itself comes
+//   later and is absorbed without a line.
+// - CTs' dead enemies award (cash_team_per_dead_enemy per dead T, at the server's pre restart):
+//   printed when the next round starts.
+// Like the server, no team income lines on the last round of a half or the match.
+enum ChatAward_e { ChatAward_Kill = 0, ChatAward_TeamKill, ChatAward_Plant, ChatAward_Defuse };
+struct ChatKill_t { int Tick; int Type; char Weapon[32]; };
 const int c_ChatMaxKills = 8;
 const int c_ChatKillTimeoutTicks = 32;
 ChatKill_t g_ChatKills[c_ChatMaxKills];
@@ -1925,20 +1939,49 @@ int g_ChatKillCount = 0;
 int g_ChatLastAccount = -1; // target's money last frame, -1 = unknown
 void * g_ChatMoneyFor = nullptr;
 
+// Round end reasons (CSRoundEndReason):
+enum { RoundEnd_TargetBombed = 1, RoundEnd_BombDefused = 7, RoundEnd_CTsWin = 8, RoundEnd_TerroristsWin = 9,
+	RoundEnd_HostagesRescued = 11, RoundEnd_TargetSaved = 12, RoundEnd_HostagesNotRescued = 13 };
+struct ChatTeamIncome_t {
+	bool Silent; // last round of a half / the match: the server prints no team income
+	bool DeadTracking; // CT target: count dead Ts until the next round starts
+	int DeadCount;
+	int SwallowAmount; // team money still to come, absorbed without a line
+	int SwallowDeadlineTick; // -1 = until the next round started
+} g_ChatTeamIncome = { false, false, 0, 0, -1 };
+int g_ChatLastWinStatus = -1; // -1 = unknown
+const int c_ChatTeamIncomeTailTicks = 256; // after the next round started
+const int c_ChatBombAward = 300; // cash_player_bomb_planted / cash_player_bomb_defused
+
 static void ChatLines_ResetMoney() {
 	g_ChatKillCount = 0;
 	g_ChatLastAccount = -1;
+	g_ChatTeamIncome.DeadTracking = false;
+	g_ChatTeamIncome.SwallowAmount = 0;
+	g_ChatTeamIncome.SwallowDeadlineTick = -1;
+	g_ChatLastWinStatus = -1;
+}
+
+static void ChatLines_AddAward(int type, const char * pszWeapon) {
+	if (c_ChatMaxKills <= g_ChatKillCount) return;
+	ChatKill_t & award = g_ChatKills[g_ChatKillCount++];
+	award.Tick = GetDemoTick();
+	award.Type = type;
+	strncpy_s(award.Weapon, nullptr != pszWeapon ? pszWeapon : "", _TRUNCATE);
 }
 
 static void ChatLines_OnDeath(SOURCESDK::CS2::IGameEvent * pEvent) {
 	if (!g_PovChatMoney || nullptr == g_ChatPrintf || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames) return;
 	CEntityInstance * pAttacker = (CEntityInstance *)GetGameEventPlayerController(pEvent, "attacker");
 	CEntityInstance * pVictim = (CEntityInstance *)GetGameEventPlayerController(pEvent, "userid");
-	if (pAttacker != g_KillCamLastSwapped || nullptr == pVictim || pVictim == pAttacker || c_ChatMaxKills <= g_ChatKillCount) return;
-	ChatKill_t & kill = g_ChatKills[g_ChatKillCount++];
-	kill.Tick = GetDemoTick();
-	kill.TeamKill = pVictim->GetTeam() == pAttacker->GetTeam();
-	strncpy_s(kill.Weapon, StripWeaponPrefix(GetGameEventString(pEvent, "weapon")), _TRUNCATE);
+	if (pAttacker != g_KillCamLastSwapped || nullptr == pVictim || pVictim == pAttacker) return;
+	ChatLines_AddAward(pVictim->GetTeam() == pAttacker->GetTeam() ? ChatAward_TeamKill : ChatAward_Kill, StripWeaponPrefix(GetGameEventString(pEvent, "weapon")));
+}
+
+static void ChatLines_OnBombEvent(SOURCESDK::CS2::IGameEvent * pEvent, int type) {
+	if (!g_PovChatMoney || nullptr == g_ChatPrintf || nullptr == g_KillCamLastSwapped || 0 < g_KillCamSuspendFrames) return;
+	if (GetGameEventPlayerController(pEvent, "userid") != g_KillCamLastSwapped) return;
+	ChatLines_AddAward(type, nullptr);
 }
 
 static const char * WeaponNameToken(const char * pszWeapon) {
@@ -1963,23 +2006,31 @@ static const char * WeaponNameToken(const char * pszWeapon) {
 	return nullptr;
 }
 
-static void ChatLines_PrintKill(const ChatKill_t & kill, int amount) {
+static void ChatLines_PrintMoney(const char * pszToken, const char * pszFallback, int amount, const char * pszParam2 = nullptr) {
 	char amountText[16];
 	_snprintf_s(amountText, _TRUNCATE, "%i", amount < 0 ? -amount : amount);
+	const char * params[] = { amountText, nullptr != pszParam2 ? pszParam2 : "" };
 	char line[512];
+	FormatLocalized(line, sizeof(line), LocalizeOr(pszToken, pszFallback), params, 2);
+	PrintChat(-1, line);
+}
+
+static void ChatLines_PrintKill(const ChatKill_t & kill, int amount) {
+	switch (kill.Type) {
+	case ChatAward_TeamKill:
+		ChatLines_PrintMoney("#Player_Cash_Award_Kill_Teammate", " -$%s1 penalty for killing a friendly", amount);
+		return;
+	case ChatAward_Plant:
+		ChatLines_PrintMoney("#Player_Cash_Award_Bomb_Planted", " +$%s1 for planting the C4", amount);
+		return;
+	case ChatAward_Defuse:
+		ChatLines_PrintMoney("#Player_Cash_Award_Bomb_Defused", " +$%s1 for defusing the C4", amount);
+		return;
+	}
 	const char * pszWeaponToken = WeaponNameToken(kill.Weapon);
 	const char * pszWeaponName = nullptr != pszWeaponToken ? Localize(pszWeaponToken) : nullptr;
-	if (kill.TeamKill) {
-		const char * params[] = { amountText };
-		FormatLocalized(line, sizeof(line), LocalizeOr("#Player_Cash_Award_Kill_Teammate", " -$%s1 penalty for killing a friendly"), params, 1);
-	} else if (nullptr != pszWeaponName) {
-		const char * params[] = { amountText, pszWeaponName };
-		FormatLocalized(line, sizeof(line), LocalizeOr("#Player_Cash_Award_Killed_Enemy", " +$%s1 for neutralizing an enemy with the %s2"), params, 2);
-	} else {
-		const char * params[] = { amountText };
-		FormatLocalized(line, sizeof(line), LocalizeOr("#Player_Cash_Award_Killed_Enemy_Generic", " +$%s1 for neutralizing an enemy"), params, 1);
-	}
-	PrintChat(-1, line);
+	if (nullptr != pszWeaponName) ChatLines_PrintMoney("#Player_Cash_Award_Killed_Enemy", " +$%s1 for neutralizing an enemy with the %s2", amount, pszWeaponName);
+	else ChatLines_PrintMoney("#Player_Cash_Award_Killed_Enemy_Generic", " +$%s1 for neutralizing an enemy", amount);
 }
 
 // Must not contain objects with destructors (SEH).
@@ -1995,29 +2046,330 @@ static int GetAccount(void * pController) {
 	}
 }
 
+// Must not contain objects with destructors (SEH). Fields < 0 if unknown.
+static bool GetRoundState(int & outWinStatus, int & outReason, int & outGamePhase) {
+	outWinStatus = outReason = outGamePhase = -1;
+	if (nullptr == g_DmgReport.ppGameRules) return false;
+	__try {
+		unsigned char * pGameRules = (unsigned char *)*g_DmgReport.ppGameRules;
+		if (nullptr == pGameRules) return false;
+		outWinStatus = *(int *)(pGameRules + g_DmgReport.OfsRoundWinStatus);
+		if (0 != g_clientDllOffsets.C_CSGameRules.m_eRoundWinReason) outReason = *(int *)(pGameRules + g_clientDllOffsets.C_CSGameRules.m_eRoundWinReason);
+		if (0 != g_clientDllOffsets.C_CSGameRules.m_gamePhase) outGamePhase = *(int *)(pGameRules + g_clientDllOffsets.C_CSGameRules.m_gamePhase);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+// Must not contain objects with destructors (SEH).
+static bool IsHostageMap() {
+	__try {
+		int highest = GetHighestEntityIndex();
+		for (int i = 65; i <= highest; ++i) {
+			CEntityInstance * pEnt = GetEntity(i);
+			if (nullptr == pEnt) continue;
+			const char * pszClass = pEnt->GetClientClassName();
+			if (nullptr != pszClass && 0 == strcmp(pszClass, "C_Hostage")) return true;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return false;
+}
+
+// Convar value (replicated ones like mp_maxrounds have the demo's value), or fallback.
+// Must not contain objects with destructors (SEH).
+static int GetCvarInt(const char * pszName, int fallback) {
+	if (nullptr == SOURCESDK::CS2::g_pCVar) return fallback;
+	__try {
+		SOURCESDK::CS2::ConVarHandle handle = SOURCESDK::CS2::g_pCVar->FindConVar(pszName, false);
+		if (!handle.IsValid()) return fallback;
+		SOURCESDK::CS2::Cvar_s * pCvar = SOURCESDK::CS2::g_pCVar->GetCvar(handle.Get());
+		if (nullptr == pCvar) return fallback;
+		switch (pCvar->m_eVarType) {
+		case SOURCESDK::CS2::EConVarType_Bool: return pCvar->m_Value.m_bValue ? 1 : 0;
+		case SOURCESDK::CS2::EConVarType_Int16: return pCvar->m_Value.m_i16Value;
+		case SOURCESDK::CS2::EConVarType_UInt16: return pCvar->m_Value.m_u16Value;
+		case SOURCESDK::CS2::EConVarType_Int32: return pCvar->m_Value.m_i32Value;
+		case SOURCESDK::CS2::EConVarType_UInt32: return (int)pCvar->m_Value.m_u32Value;
+		case SOURCESDK::CS2::EConVarType_Float32: return (int)pCvar->m_Value.m_flValue;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+	}
+	return fallback;
+}
+
+// Must not contain objects with destructors (SEH).
+static int GetGameRulesInt(ptrdiff_t offset, int fallback) {
+	if (0 == offset || nullptr == g_DmgReport.ppGameRules) return fallback;
+	__try {
+		unsigned char * pGameRules = (unsigned char *)*g_DmgReport.ppGameRules;
+		if (nullptr == pGameRules) return fallback;
+		return *(int *)(pGameRules + offset);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return fallback;
+	}
+}
+
+// The winner's award for the round end reason (server defaults as fallback), 0 = none.
+static int ChatLines_WinnerIncome(int reason, bool bTerrorist) {
+	switch (reason) {
+	case RoundEnd_TargetBombed: return GetCvarInt("cash_team_terrorist_win_bomb", 3500);
+	case RoundEnd_BombDefused: return GetCvarInt("cash_team_win_by_defusing_bomb", 3250);
+	case RoundEnd_CTsWin:
+	case RoundEnd_TerroristsWin:
+		if (IsHostageMap()) return bTerrorist ? GetCvarInt("cash_team_elimination_hostage_map_t", 1000) : GetCvarInt("cash_team_elimination_hostage_map_ct", 2000);
+		return GetCvarInt("cash_team_elimination_bomb_map", 3250);
+	case RoundEnd_TargetSaved: return GetCvarInt("cash_team_win_by_time_running_out_bomb", 3250);
+	case RoundEnd_HostagesNotRescued: return GetCvarInt("cash_team_win_by_time_running_out_hostage", 3250);
+	case RoundEnd_HostagesRescued: return GetCvarInt("cash_team_win_by_hostage_rescue", 3500);
+	}
+	return 0;
+}
+
+// Loss bonus like the server: cash_team_loser_bonus + cash_team_loser_bonus_consecutive_rounds *
+// min(losses, mp_consecutive_loss_max), with the loss count from before this round. The client
+// gets the already incremented count together with the round end (seen in a diag log), so - 1.
+// (Teams start at 1, so losing the pistol round gives 1900.)
+static int ChatLines_LoserBonus(bool bTerrorist) {
+	int losses = GetGameRulesInt(bTerrorist ? g_clientDllOffsets.C_CSGameRules.m_iNumConsecutiveTerroristLoses : g_clientDllOffsets.C_CSGameRules.m_iNumConsecutiveCTLoses, 1) - 1;
+	int cap = GetCvarInt("mp_consecutive_loss_max", 4);
+	if (cap < losses) losses = cap;
+	if (losses < 0) losses = 0;
+	return GetCvarInt("cash_team_loser_bonus", 1400) + GetCvarInt("cash_team_loser_bonus_consecutive_rounds", 500) * losses;
+}
+
+// The server prints no team income on the last round of a half or the match (money resets).
+static bool ChatLines_IsLastRoundOfHalfOrMatch(int gamePhase) {
+	if (4 == gamePhase || 5 == gamePhase) return true; // halftime / match ended
+	int played = GetGameRulesInt(g_clientDllOffsets.C_CSGameRules.m_totalRoundsPlayed, -1); // includes this round
+	if (played <= 0) return false;
+	int maxRounds = GetCvarInt("mp_maxrounds", 24);
+	if (maxRounds <= 0) return false;
+	if (played <= maxRounds) return played == maxRounds || (0 != GetCvarInt("mp_halftime", 1) && played == maxRounds / 2);
+	int overtimeHalf = GetCvarInt("mp_overtime_maxrounds", 6) / 2;
+	return 0 < overtimeHalf && 0 == (played - maxRounds) % overtimeHalf;
+}
+
+static void ChatLines_PrintTeamIncomeLines(int reason, bool bWon, bool bTerrorist, bool bAlive) {
+	int swallow = 0;
+	if (bWon) {
+		int amount = ChatLines_WinnerIncome(reason, bTerrorist);
+		swallow = amount;
+		if (!g_ChatTeamIncome.Silent && 0 < amount) {
+			switch (reason) {
+			case RoundEnd_TargetBombed: ChatLines_PrintMoney("#Team_Cash_Award_T_Win_Bomb", " +$%s1 team income for detonating bomb", amount); break;
+			case RoundEnd_BombDefused: ChatLines_PrintMoney("#Team_Cash_Award_Win_Defuse_Bomb", " +$%s1 team income for defusing the C4", amount); break;
+			case RoundEnd_CTsWin:
+			case RoundEnd_TerroristsWin:
+				if (IsHostageMap()) ChatLines_PrintMoney("#Team_Cash_Award_Elim_Hostage", " +$%s1 team income for eliminating the enemy team", amount);
+				else ChatLines_PrintMoney("#Team_Cash_Award_Elim_Bomb", " +$%s1 team income for eliminating the enemy team", amount);
+				break;
+			case RoundEnd_TargetSaved:
+			case RoundEnd_HostagesNotRescued: ChatLines_PrintMoney("#Team_Cash_Award_Win_Time", " +$%s1 team income for running down the clock", amount); break;
+			case RoundEnd_HostagesRescued: ChatLines_PrintMoney("#Team_Cash_Award_Win_Hostages_Rescue", " +$%s1 team income for rescuing the hostages", amount); break;
+			}
+		}
+	} else if (bTerrorist && RoundEnd_TargetSaved == reason && bAlive) {
+		// Ts still alive when the time ran out get nothing.
+		if (!g_ChatTeamIncome.Silent) PrintChat(-1, LocalizeOr("#Team_Cash_Award_No_Income", " +$0 penalty for running out of time"));
+	} else {
+		int bonus = ChatLines_LoserBonus(bTerrorist);
+		swallow = bonus;
+		if (!g_ChatTeamIncome.Silent && 0 < bonus) ChatLines_PrintMoney("#Team_Cash_Award_Loser_Bonus", " +$%s1 team income for losing", bonus);
+		if (bTerrorist && RoundEnd_BombDefused == reason) {
+			int planted = GetCvarInt("cash_team_planted_bomb_but_defused", 600);
+			swallow += planted;
+			if (!g_ChatTeamIncome.Silent && 0 < planted) ChatLines_PrintMoney("#Team_Cash_Award_Planted_Bomb_But_Defused", " +$%s1 team income for planting the bomb", planted);
+		}
+	}
+	g_ChatTeamIncome.SwallowAmount += swallow;
+	g_ChatTeamIncome.SwallowDeadlineTick = -1;
+	DiagLog("mirv_pov money: round end reason %i won %i T %i alive %i -> team income %i (losses CT %i T %i, silent %i)\n",
+		reason, bWon ? 1 : 0, bTerrorist ? 1 : 0, bAlive ? 1 : 0, swallow,
+		GetGameRulesInt(g_clientDllOffsets.C_CSGameRules.m_iNumConsecutiveCTLoses, -1),
+		GetGameRulesInt(g_clientDllOffsets.C_CSGameRules.m_iNumConsecutiveTerroristLoses, -1), g_ChatTeamIncome.Silent ? 1 : 0);
+}
+
+// Must not contain objects with destructors (SEH).
+static bool IsAlive(void * pPawn) {
+	if (nullptr == pPawn) return false;
+	__try {
+		return 0 < ((CEntityInstance *)pPawn)->GetHealth();
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		return false;
+	}
+}
+
+static int ChatLines_CountDeadTerrorists() {
+	int dead = 0;
+	for (int i = 1; i <= 64; ++i) {
+		CEntityInstance * pController = GetEntity(i);
+		if (nullptr == pController || !pController->IsPlayerController() || 2 != pController->GetTeam()) continue;
+		if (!IsAlive(GetTargetPlayerPawn(i))) ++dead;
+	}
+	return dead;
+}
+
+// Resolves the ICU style "{num_enemies}" and "{num_enemies, plural, one{..} other{..}}" in text.
+static std::string ApplyNumEnemies(const std::string & text, int count) {
+	std::string result;
+	size_t pos = 0;
+	while (pos < text.size()) {
+		size_t open = text.find("{num_enemies", pos);
+		if (std::string::npos == open) break;
+		result.append(text, pos, open - pos);
+		// Find the matching close brace.
+		int depth = 0;
+		size_t close = open;
+		for (; close < text.size(); ++close) {
+			if ('{' == text[close]) ++depth;
+			else if ('}' == text[close] && 0 == --depth) break;
+		}
+		if (text.size() <= close) {
+			pos = open;
+			break;
+		}
+		std::string inner = text.substr(open + 1, close - open - 1);
+		if (inner == "num_enemies") result += std::to_string(count);
+		else {
+			const char * pszForm = 1 == count ? "one{" : "other{";
+			size_t form = inner.find(pszForm);
+			if (std::string::npos != form) {
+				size_t start = form + strlen(pszForm);
+				size_t end = inner.find('}', start);
+				if (std::string::npos != end) result.append(inner, start, end - start);
+			}
+		}
+		pos = close + 1;
+	}
+	result.append(text, pos, std::string::npos);
+	return result;
+}
+
+static void ChatLines_PrintDeadEnemies(int amount, int count) {
+	char amountText[16];
+	_snprintf_s(amountText, _TRUNCATE, "%i", amount);
+	const char * params[] = { amountText };
+	char line[512];
+	FormatLocalized(line, sizeof(line), LocalizeOr("#Team_Cash_Award_Dead_Terrorists:f",
+		" +$%s1 team income for {num_enemies} eliminated {num_enemies, plural, one{terrorist} other{terrorists}}"), params, 1);
+	PrintChat(-1, ApplyNumEnemies(line, count).c_str());
+}
+
+// Round end: team income lines. Next round start: CTs' dead enemies line.
+static void ChatLines_OnRoundState(int tick) {
+	int winStatus, reason, gamePhase;
+	if (!GetRoundState(winStatus, reason, gamePhase)) return;
+	if (g_ChatLastWinStatus < 0) {
+		g_ChatLastWinStatus = winStatus;
+		return;
+	}
+	if (0 != winStatus && g_ChatTeamIncome.DeadTracking) g_ChatTeamIncome.DeadCount = ChatLines_CountDeadTerrorists(); // until the server counts them (pre restart)
+	if (winStatus == g_ChatLastWinStatus) return;
+	if (0 == g_ChatLastWinStatus && (2 == winStatus || 3 == winStatus)) { // round won
+		int team = ((CEntityInstance *)g_KillCamLastSwapped)->GetTeam();
+		if (2 == team || 3 == team) {
+			g_ChatTeamIncome.Silent = ChatLines_IsLastRoundOfHalfOrMatch(gamePhase);
+			ChatLines_PrintTeamIncomeLines(reason, winStatus == team, 2 == team, IsAlive(GetSwappedTargetPlayerPawn()));
+			g_ChatTeamIncome.DeadTracking = 3 == team;
+			g_ChatTeamIncome.DeadCount = g_ChatTeamIncome.DeadTracking ? ChatLines_CountDeadTerrorists() : 0;
+		}
+	} else if (0 == winStatus) { // next round started
+		if (g_ChatTeamIncome.DeadTracking) {
+			g_ChatTeamIncome.DeadTracking = false;
+			int amount = g_ChatTeamIncome.DeadCount * GetCvarInt("cash_team_per_dead_enemy", 50);
+			if (0 < amount) {
+				g_ChatTeamIncome.SwallowAmount += amount;
+				if (!g_ChatTeamIncome.Silent) ChatLines_PrintDeadEnemies(amount, g_ChatTeamIncome.DeadCount);
+			}
+		}
+		if (0 < g_ChatTeamIncome.SwallowAmount) g_ChatTeamIncome.SwallowDeadlineTick = tick + c_ChatTeamIncomeTailTicks;
+	}
+	g_ChatLastWinStatus = winStatus;
+}
+
 // Once per rendered frame (not while suspended).
 static void ChatLines_OnFrame() {
 	if (g_ChatMoneyFor != g_KillCamLastSwapped) {
 		g_ChatMoneyFor = g_KillCamLastSwapped;
 		ChatLines_ResetMoney();
 	}
-	if (nullptr == g_KillCamLastSwapped) return;
+	if (nullptr == g_KillCamLastSwapped || !g_PovChatMoney || nullptr == g_ChatPrintf) return;
 	static int s_lastTick = -1;
 	int tick = GetDemoTick();
 	if (tick < s_lastTick) ChatLines_ResetMoney(); // seeked back
 	s_lastTick = tick;
+	ChatLines_OnRoundState(tick);
 	int account = GetAccount(g_KillCamLastSwapped);
 	if (account < 0) return;
-	if (0 <= g_ChatLastAccount && account != g_ChatLastAccount && 0 < g_ChatKillCount) {
+	if (g_PovDiag) {
+		// When do money, round state and loss counters change relative to each other?
+		static int s_last[5] = { -2, -2, -2, -2, -2 };
+		int winStatus, reason, gamePhase;
+		GetRoundState(winStatus, reason, gamePhase);
+		int now[5] = { account, winStatus,
+			GetGameRulesInt(g_clientDllOffsets.C_CSGameRules.m_iNumConsecutiveCTLoses, -1),
+			GetGameRulesInt(g_clientDllOffsets.C_CSGameRules.m_iNumConsecutiveTerroristLoses, -1),
+			GetGameRulesInt(g_clientDllOffsets.C_CSGameRules.m_totalRoundsPlayed, -1) };
+		if (0 != memcmp(now, s_last, sizeof(now))) {
+			DiagLog("mirv_pov money: tick %i account %i (%+i) | win status %i reason %i phase %i | losses CT %i T %i | rounds played %i | swallow %i\n",
+				tick, account, -2 != s_last[0] ? account - s_last[0] : 0, winStatus, reason, gamePhase, now[2], now[3], now[4], g_ChatTeamIncome.SwallowAmount);
+			memcpy(s_last, now, sizeof(now));
+		}
+	}
+	if (0 <= g_ChatLastAccount && account != g_ChatLastAccount) {
 		int delta = account - g_ChatLastAccount;
+		int kills = 0, teamKills = 0, bombAwards = 0;
+		for (int i = 0; i < g_ChatKillCount; ++i) {
+			switch (g_ChatKills[i].Type) {
+			case ChatAward_Kill: ++kills; break;
+			case ChatAward_TeamKill: ++teamKills; break;
+			default: ++bombAwards; break;
+			}
+		}
+		int remainder = delta;
+		if (0 < delta) {
+			// C4 plant / defuse: fixed cash_player_bomb_planted / _defused, printed even if the
+			// money is capped, like the server does.
+			if (0 < bombAwards) {
+				int bombSum = 0;
+				int kept = 0;
+				for (int i = 0; i < g_ChatKillCount; ++i) {
+					int amount = -1;
+					if (ChatAward_Plant == g_ChatKills[i].Type) amount = GetCvarInt("cash_player_bomb_planted", c_ChatBombAward);
+					else if (ChatAward_Defuse == g_ChatKills[i].Type) amount = GetCvarInt("cash_player_bomb_defused", c_ChatBombAward);
+					if (0 <= amount) {
+						ChatLines_PrintKill(g_ChatKills[i], amount);
+						bombSum += amount;
+					} else g_ChatKills[kept++] = g_ChatKills[i];
+				}
+				g_ChatKillCount = kept;
+				remainder = delta - bombSum;
+				if (remainder < 0) remainder = 0;
+			}
+			// Team money we already printed at the round end:
+			if (0 < remainder && 0 < g_ChatTeamIncome.SwallowAmount) {
+				int take = remainder < g_ChatTeamIncome.SwallowAmount ? remainder : g_ChatTeamIncome.SwallowAmount;
+				g_ChatTeamIncome.SwallowAmount -= take;
+				remainder -= take;
+			}
+		}
 		// Kill rewards add money, team kills cost it; anything else (buying) isn't for us.
-		bool bTeamKill = g_ChatKills[0].TeamKill;
-		if (bTeamKill ? delta < 0 : 0 < delta) {
-			int count = 0;
-			for (int i = 0; i < g_ChatKillCount; ++i) if (g_ChatKills[i].TeamKill == bTeamKill) ++count;
-			for (int i = 0; i < g_ChatKillCount; ++i) if (g_ChatKills[i].TeamKill == bTeamKill) ChatLines_PrintKill(g_ChatKills[i], delta / count);
+		bool bPositive = 0 < remainder;
+		int count = bPositive ? kills : (remainder < 0 ? teamKills : 0);
+		if (0 < count) {
+			int wanted = bPositive ? ChatAward_Kill : ChatAward_TeamKill;
 			int kept = 0;
-			for (int i = 0; i < g_ChatKillCount; ++i) if (g_ChatKills[i].TeamKill != bTeamKill) g_ChatKills[kept++] = g_ChatKills[i];
+			for (int i = 0; i < g_ChatKillCount; ++i) {
+				if (wanted == g_ChatKills[i].Type) ChatLines_PrintKill(g_ChatKills[i], remainder / count);
+				else g_ChatKills[kept++] = g_ChatKills[i];
+			}
 			g_ChatKillCount = kept;
 		}
 	}
@@ -2029,6 +2381,10 @@ static void ChatLines_OnFrame() {
 		g_ChatKills[kept++] = g_ChatKills[i];
 	}
 	g_ChatKillCount = kept;
+	if (0 <= g_ChatTeamIncome.SwallowDeadlineTick && g_ChatTeamIncome.SwallowDeadlineTick < tick) {
+		g_ChatTeamIncome.SwallowAmount = 0; // e.g. capped money
+		g_ChatTeamIncome.SwallowDeadlineTick = -1;
+	}
 }
 
 // Must not contain objects with destructors (SEH).
@@ -2080,6 +2436,16 @@ bool MirvPov_BeforeClientGameEvent(SOURCESDK::CS2::IGameEvent * pEvent) {
 
 	if (0 == strcmp(pszName, "weapon_fire")) {
 		ChatLines_OnWeaponFire(pEvent);
+		return false;
+	}
+
+	if (0 == strcmp(pszName, "bomb_planted")) {
+		ChatLines_OnBombEvent(pEvent, ChatAward_Plant);
+		return false;
+	}
+
+	if (0 == strcmp(pszName, "bomb_defused")) {
+		ChatLines_OnBombEvent(pEvent, ChatAward_Defuse);
 		return false;
 	}
 
