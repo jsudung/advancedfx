@@ -217,7 +217,7 @@ Missing / wrong:
 - Round-end damage report under avatars (no `PostRoundDamageReport`).
 - Flash/HE ringing and muffling, HE screen shake.
 
-### AWP scope blur investigation (parked)
+### AWP scope blur — fixed
 
 - The blur is wrong in all `hltv` modes, so no HLTV check is involved. It appears frozen
   at the state at the last (re-)swap / seek.
@@ -229,7 +229,17 @@ Missing / wrong:
   interpolated variable (camera services vtable[8]). The scope shader parameters come
   from the view setup (client.dll ~0x11ec870). The likely cause is local-player
   interpolation of that variable. Fixing it needs deeper RE of component variable
-  interpolation for the local player. **Parked as a known issue.**
+  interpolation for the local player. (This guess was wrong, see below.)
+- **Cause:** the value is written by an update function (client.dll `0xc999d0`): active
+  weapon → `GetInaccuracy(0, 0)` (vtable 0xcf8) + spread (0xbd0), zoom level (0xc40), minimum
+  inaccuracy (0xb48) → `0xc94a80(cameraServices, (inaccuracy - min) * k, inaccuracy + spread)`,
+  which sets `+0x2c0` through the interpolated var. `C_CSPlayerPawn` calls it from two places,
+  picked by pawn `+0x14c5` (set from the controller's `m_bIsLocalPlayerController`):
+  vtable[146] every frame for non-local pawns, vtable[321] for the local pawn. The local path
+  doesn't run in demos. After the swap the target counts as local, so nobody updates it.
+- **Fix:** call the update for the swapped target ourselves in the render pass
+  (`scopeblur 0|1`). Pattern: the function start up to the `GetInaccuracy` call, checked
+  against `m_pCameraServices`.
 
 ### Death card ("X killed you with ...") — working
 

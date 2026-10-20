@@ -100,6 +100,16 @@ typedef void (__fastcall * DamageIndicator_ShowDirection_t)(void * pIndicator, c
 DamageIndicator_ShowDirection_t g_DamageIndicator_ShowDirection = nullptr;
 bool g_PovDamageArcs = true;
 
+// Scope blur: the scope overlay's blur comes from CCSPlayer_CameraServices::m_vClientScopeInaccuracy
+// (client only, interpolated), set from the active weapon's inaccuracy and spread by an update
+// function. C_CSPlayerPawn calls it every frame for non-local pawns (vtable[146]) and for the local
+// pawn from another path (vtable[321]) that doesn't run in demos, so in POV it froze at the swap.
+// We call it for the target ourselves.
+typedef void (__fastcall * UpdateScopeInaccuracy_t)(void * pPawn);
+UpdateScopeInaccuracy_t g_UpdateScopeInaccuracy = nullptr;
+int g_UpdateScopeInaccuracyCameraServicesOfs = 0; // checked against the schema on first use (not resolved yet at hook time)
+bool g_PovScopeBlur = true;
+
 // Chat lines from player-only messages (CCSUsrMsg_RadioText, CUserMessageTextMsg) that GOTV demos
 // don't have: grenade radio ("[CT] Name﹫Place: Flashbang!") from teammates' weapon_fire, and the
 // kill reward (" +$300 for neutralizing an enemy with the AK-47") from the target's kills plus their
@@ -991,6 +1001,7 @@ void PrintInfo() {
 			DamageReport_GetRoundWinStatus(winStatus);
 			if (nullptr != *g_DmgReport.ppUseNetvarsCvar) useNetvars = *(*g_DmgReport.ppUseNetvarsCvar + g_DmgReport.OfsCvarValue) ? 1 : 0;
 		}
+		InfoPrintf("Scope blur update: %s, on %i\n", nullptr != g_UpdateScopeInaccuracy ? "OK" : "MISSING", g_PovScopeBlur ? 1 : 0);
 		InfoPrintf("Damage arcs: hook %s, on %i | chat lines: print %s, localize %s, radio %i, kill reward %i (money +0x%llx/+0x%llx, place +0x%llx)\n",
 			nullptr != g_DamageIndicator_ShowDirection ? "OK" : "MISSING", g_PovDamageArcs ? 1 : 0,
 			nullptr != g_ChatPrintf ? "OK" : "MISSING", nullptr != g_ppLocalize ? "OK" : "MISSING", g_PovChatRadio ? 1 : 0, g_PovChatMoney ? 1 : 0,
@@ -1261,6 +1272,18 @@ void MirvPov_HookClientDll(HMODULE clientDll) {
 		} else advancedfx::Warning("mirv_pov: CCSUsrMsg_Damage handler not found (no damage direction arcs).\n");
 	}
 
+	// Scope inaccuracy update: weapon = GetActiveWeapon(pawn); cameraServices = pawn->m_pCameraServices;
+	// ... weapon->GetInaccuracy(0, 0) (vtable 0xcf8) ...
+	{
+		Afx::BinUtils::MemRange sbResult = Afx::BinUtils::FindPatternString(textRange,
+			"48 89 5C 24 10 57 48 83 EC 50 48 8B D9 E8 ?? ?? ?? ?? 48 8B F8 48 85 C0 0F 84 ?? ?? ?? ?? 48 89 74 24 60 48 8B B3 ?? ?? ?? ?? "
+			"48 85 F6 0F 84 ?? ?? ?? ?? 48 8B 08 45 33 C0 0F 29 74 24 40 33 D2 0F 29 7C 24 30 44 0F 29 44 24 20 4C 8B 89 ?? ?? ?? ?? 48 8B C8 41 FF D1");
+		if (!sbResult.IsEmpty()) {
+			g_UpdateScopeInaccuracy = (UpdateScopeInaccuracy_t)sbResult.Start;
+			g_UpdateScopeInaccuracyCameraServicesOfs = *(int *)(sbResult.Start + 0x26);
+		} else advancedfx::Warning("mirv_pov: scope inaccuracy update not found (scope blur stays frozen in POV).\n");
+	}
+
 	// CCSUsrMsg_RadioText handler: ... ChatPrintf(this, &filter, client, "%s", text); then "HudChat.Message" if enabled,
 	// and earlier: mov rcx, [g_pLocalize]; lea r15, [""]; mov rdx, r15; mov rax, [rcx]; mov r8, [rax+Find]
 	{
@@ -1447,6 +1470,24 @@ void MirvPov_HookEngine2Dll(HMODULE engine2Dll) {
 static void ChatLines_OnFrame();
 static void MuteRadio_OnFrame();
 
+// Must not contain objects with destructors (SEH).
+static void ScopeBlur_OnFrame() {
+	if (!g_PovScopeBlur || nullptr == g_UpdateScopeInaccuracy || nullptr == g_KillCamLastSwapped) return;
+	if (g_clientDllOffsets.C_BasePlayerPawn.m_pCameraServices != g_UpdateScopeInaccuracyCameraServicesOfs) {
+		g_UpdateScopeInaccuracy = nullptr;
+		advancedfx::Warning("mirv_pov: scope inaccuracy update doesn't match m_pCameraServices (scope blur stays frozen in POV).\n");
+		return;
+	}
+	void * pPawn = GetSwappedTargetPlayerPawn();
+	if (nullptr == pPawn) return;
+	__try {
+		g_UpdateScopeInaccuracy(pPawn);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		g_UpdateScopeInaccuracy = nullptr;
+	}
+}
+
 void MirvPov_BeforeFrameStageNotify(int curStage) {
 	SetScoreboardPatch(0 != g_HltvSpoofMode && nullptr != g_KillCamLastSwapped && 0 == g_KillCamSuspendFrames);
 
@@ -1464,6 +1505,7 @@ void MirvPov_BeforeFrameStageNotify(int curStage) {
 		DamageReport_OnFrame();
 		ChatLines_OnFrame();
 		MuteRadio_OnFrame();
+		ScopeBlur_OnFrame();
 	}
 
 	// After a (re-)swap: undo the predictability the game just gave the target's entities.
@@ -2619,6 +2661,16 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 			return;
 		}
 
+		if (0 == _stricmp(cmd, "scopeblur") && 3 <= argc) {
+			if (nullptr == g_UpdateScopeInaccuracy) {
+				advancedfx::Warning("mirv_pov: scope inaccuracy update not found.\n");
+				return;
+			}
+			g_PovScopeBlur = 0 != atoi(args->ArgV(2));
+			advancedfx::Message("mirv_pov: scope blur update %s.\n", g_PovScopeBlur ? "on" : "off");
+			return;
+		}
+
 		if (0 == _stricmp(cmd, "damagearcs") && 3 <= argc) {
 			if (nullptr == g_DamageIndicator_ShowDirection) {
 				advancedfx::Warning("mirv_pov: damage direction hook not installed.\n");
@@ -2713,6 +2765,7 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s deathcard <0|1> - Show the \"killed you with\" death card (default 1).\n"
 		"%s damagereport <0|1|show> - Round end damage report under the avatars (default 1), show = now, with what's collected so far.\n"
 		"%s damagearcs <0|1> - Damage direction arcs when the player gets hit (default 1).\n"
+		"%s scopeblur <0|1> - Update the scope blur from the player's weapon inaccuracy (default 1).\n"
 		"%s radio <0|1> - Grenade radio chat lines of the player's team (default 1).\n"
 		"%s killreward <0|1> - Kill reward chat lines (default 1).\n"
 		"%s bombshake <0|1> - C4 explosion screen shake (default 1). Grenades don't shake the screen in CS2.\n"
@@ -2723,6 +2776,6 @@ CON_COMMAND(mirv_pov_debug, "Advanced / diagnostic switches for mirv_pov.")
 		"%s chatlog <0|1> - Log chat (SayText2) messages arriving at the chat HUD.\n"
 		"%s hltvlog [0|1] - IsHLTV() caller logging on (resets) / off, without argument prints the callers.\n"
 		"%s diag <0|1> - Diagnostic logging to console and %%TEMP%%\\mirv_pov_log.txt (default 0).\n"
-		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
+		, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0, arg0
 	);
 }

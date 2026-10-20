@@ -26,6 +26,7 @@ follow the POV player, also when seeking to a moment where they're dead.
 - Player radar: teammates in their colours, enemies only when spotted, C4 carrier.
 - The player's own crosshair (new-format `CS...` crosshair codes).
 - No buy-menu blur when the player opens their buy menu.
+- AWP/SSG scope blur that follows the player's weapon inaccuracy (moving, firing).
 - Death camera and the "killed you with ..." death card.
 - Damage direction arcs when the player gets hit (pointing at the attacker).
 - Round end damage report under the avatars (damage / hits given and taken, kill type). It's
@@ -47,7 +48,6 @@ follow the POV player, also when seeking to a moment where they're dead.
 
 ## Known limitations
 
-- **AWP/SSG scope blur** doesn't follow the recording (local-player interpolation; parked).
 - **Old-format crosshair codes** (`CSGO-...` version 1, common in pro demos) are rejected by
   current CS2, which then uses your own crosshair (same as normal spectating).
 - **Chat in Valve matchmaking demos** is encrypted. Global chat only shows when watched via the
@@ -70,6 +70,7 @@ follow the POV player, also when seeking to a moment where they're dead.
 | `predict 0\|1` | 0 | 1 lets the game predict the player's pawn (game default) |
 | `deathcard 0\|1` | 1 | Show the death card |
 | `damagearcs 0\|1` | 1 | Damage direction arcs |
+| `scopeblur 0\|1` | 1 | Update the scope blur from the player's weapon inaccuracy |
 | `radio 0\|1` | 1 | Grenade radio chat lines |
 | `killreward 0\|1` | 1 | Money chat lines (kill, plant / defuse, team income) |
 | `enemyradio 0\|1` | 0 | 1 keeps the enemy team's radio voice lines audible |
@@ -105,7 +106,7 @@ Tested in game on a Valve MM demo and a pro tournament demo.
 | Enemy radio voice muted | Working |
 | No spectator x-ray in POV | Working |
 | Flash / HE ear ringing, C4 screen shake | Working |
-| AWP/SSG scope blur | Broken (parked) |
+| AWP/SSG scope blur | Working |
 
 ## TODO / next steps
 
@@ -118,8 +119,6 @@ Missing / to fix:
       Could fill it by reading the demo's events ahead, or by noting the gap.
 - [ ] **Damage direction arcs, grenade / fire damage:** use the grenade or inferno position
       instead of the attacker's.
-- [ ] **AWP/SSG scope blur:** the local player's `m_vClientScopeInaccuracy` interpolation
-      ignores the recording (see `mirv_pov_spike.md`).
 - [ ] **Old `CSGO-` v1 crosshair codes:** convert to the new format before applying.
 - [ ] **View angles:** use the recorded usercmd angles for a smoother first-person view.
 
