@@ -55,6 +55,12 @@ follow the POV player, also when seeking to a moment where they're dead.
 - **Damage direction arcs** point at the attacker, also for grenade and fire damage (the
   real game points at the grenade / fire).
 - **Not recorded in GOTV demos, so not shown:** radio command lines ("Enemy spotted", ...).
+- **Radio voice lines are missing in some demos.** Valve MM demos record every agent voice line
+  (`sas.ct_flashbang02`, ...), but tournament demos can lack them entirely (the StarLadder
+  Vitality vs FURIA demo has none, also in normal playback). Then only the radio chat text
+  shows. Out of scope: playing them ourselves would need the agent's VO prefix
+  (`m_strVOPrefix`, server-only; the client might get it from the agent's item definition, it
+  builds `%s.vo_preview` for agent previews).
 - **Money lines:** kill rewards come from the player's money change, so there's no kill line
   when the money doesn't change (e.g. at max money). Team income amounts are computed from the
   round result and the server's money convars (the demo's replicated values, else CS2's
