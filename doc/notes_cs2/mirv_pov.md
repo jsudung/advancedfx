@@ -44,7 +44,8 @@ follow the POV player, also when seeking to a moment where they're dead.
   last round of a half or the match.
 - Only the player's own team's radio voice lines are heard (GOTV demos have both teams').
 - Ear ringing (with the muffling) after flashbangs and big HE hits, and the C4 explosion screen
-  shake, like the server does for players. Grenades don't shake the screen in CS2.
+  shake, like the server does for players. Grenades don't shake the screen in CS2. Also works
+  in demos without `player_blind` events (some tournament demos).
 
 ## Known limitations
 
@@ -111,7 +112,7 @@ Tested in game on a Valve MM demo and a pro tournament demo.
 | Plant / defuse and team income chat lines | Working (verified against a money log) |
 | Enemy radio voice muted | Working |
 | No spectator x-ray in POV | Working |
-| Flash / HE ear ringing, C4 screen shake | Working |
+| Flash / HE ear ringing, C4 screen shake | Working (also in demos without `player_blind`) |
 | AWP/SSG scope blur | Working |
 
 ## TODO / next steps

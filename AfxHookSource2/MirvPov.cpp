@@ -173,6 +173,7 @@ int g_SoundSystemTriggerControlIndex = -1;
 bool g_PovEarRinging = true;
 float g_LastFlashPos[3] = {};
 int g_LastFlashTick = -1;
+int g_LastBlindTick = -1; // the target's last player_blind
 
 // Spectator tools (x-ray: every player glows through walls in team colour, ...) are on when
 //   force_spectator_only_tools || (local->m_bIsLocalPlayerController ? g_bIsHLTV : local->m_bIsHLTV) || <pawn / game mode checks>
@@ -1021,9 +1022,9 @@ void PrintInfo() {
 				nullptr != g_Org_SpectatorToolsEnabled ? "OK" : "MISSING", g_PovNoSpectatorTools ? 1 : 0, g_SpecToolsLastOriginal ? 1 : 0, g_SpecToolsBlocked,
 				forceTools, GetEntityIndex(pLocal), localIsLocal, localIsHltv, cachedHltv);
 		}
-		InfoPrintf("C4 shake: view effects %s, on %i (m_fFlags +0x%llx) | ear ringing: on %i, deafen control %s\n",
+		InfoPrintf("C4 shake: view effects %s, on %i (m_fFlags +0x%llx) | ear ringing: on %i, deafen control %s (m_flFlashBangTime +0x%llx)\n",
 			nullptr != g_pViewEffects ? "OK" : "MISSING", g_PovBombShake ? 1 : 0, (unsigned long long)g_clientDllOffsets.C_BaseEntity.m_fFlags,
-			g_PovEarRinging ? 1 : 0, nullptr != g_ppSoundSystem ? "OK" : "MISSING");
+			g_PovEarRinging ? 1 : 0, nullptr != g_ppSoundSystem ? "OK" : "MISSING", (unsigned long long)g_clientDllOffsets.C_CSPlayerPawn.m_flFlashBangTime);
 		InfoPrintf("Chat sound: %s | enemy radio mute: hook %s, on %i, active %i, muted so far %li (hash +0x%llx, source +0x%llx)\n",
 			nullptr != g_EmitSound ? "OK" : "MISSING", nullptr != g_Org_SosStartSoundEvent_Parse ? "OK" : "MISSING",
 			g_PovMuteEnemyRadio ? 1 : 0, g_MuteVoActive ? 1 : 0, g_MuteVoCount,
@@ -1469,6 +1470,7 @@ void MirvPov_HookEngine2Dll(HMODULE engine2Dll) {
 
 static void ChatLines_OnFrame();
 static void MuteRadio_OnFrame();
+static void Effects_OnFrame();
 
 // Must not contain objects with destructors (SEH).
 static void ScopeBlur_OnFrame() {
@@ -1506,6 +1508,7 @@ void MirvPov_BeforeFrameStageNotify(int curStage) {
 		ChatLines_OnFrame();
 		MuteRadio_OnFrame();
 		ScopeBlur_OnFrame();
+		Effects_OnFrame();
 	}
 
 	// After a (re-)swap: undo the predictability the game just gave the target's entities.
@@ -1858,25 +1861,55 @@ static void Effects_OnFlashDetonate(SOURCESDK::CS2::IGameEvent * pEvent) {
 	g_LastFlashTick = GetDemoTick();
 }
 
+static bool HasRecentFlashDetonate() {
+	return 0 <= g_LastFlashTick && abs(GetDemoTick() - g_LastFlashTick) <= 64;
+}
+
 // Flashbang deafen: only for blinded players, by the distance between the flash and the player's eyes.
-static void Effects_OnPlayerBlind(SOURCESDK::CS2::IGameEvent * pEvent) {
-	if (!g_PovEarRinging || !IsPovActive()) return;
-	if (GetGameEventPlayerController(pEvent, "userid") != g_KillCamLastSwapped) return;
-	CEntityInstance * pPawn = (CEntityInstance *)GetSwappedTargetPlayerPawn();
-	if (nullptr == pPawn) return;
-	float flash[3] = { FLT_MAX, 0, 0 };
-	int flashEntity = GetGameEventInt(pEvent, "entityid");
-	if (CEntityInstance * pFlash = 0 < flashEntity ? GetEntity(flashEntity) : nullptr) pFlash->GetOrigin(flash[0], flash[1], flash[2]);
-	if (FLT_MAX == flash[0]) {
-		if (g_LastFlashTick < 0 || 64 < abs(GetDemoTick() - g_LastFlashTick)) return;
-		memcpy(flash, g_LastFlashPos, sizeof(flash));
-	}
+static void Effects_FlashRing(CEntityInstance * pPawn, const float flash[3]) {
 	float eye[3];
 	pPawn->GetRenderEyeOrigin(eye);
 	float distance = Distance(flash, eye);
 	if (distance < 100.0f) PlayEarRinging("Flashbang.Ring.Long", "control.deafenlong");
 	else if (distance < 500.0f) PlayEarRinging("Flashbang.Ring.Medium", "control.deafenmedium");
 	else if (distance < 1000.0f) PlayEarRinging("Flashbang.Ring.Short", "control.deafenshort");
+}
+
+static void Effects_OnPlayerBlind(SOURCESDK::CS2::IGameEvent * pEvent) {
+	if (!g_PovEarRinging || !IsPovActive()) return;
+	if (GetGameEventPlayerController(pEvent, "userid") != g_KillCamLastSwapped) return;
+	g_LastBlindTick = GetDemoTick();
+	CEntityInstance * pPawn = (CEntityInstance *)GetSwappedTargetPlayerPawn();
+	if (nullptr == pPawn) return;
+	float flash[3] = { FLT_MAX, 0, 0 };
+	int flashEntity = GetGameEventInt(pEvent, "entityid");
+	if (CEntityInstance * pFlash = 0 < flashEntity ? GetEntity(flashEntity) : nullptr) pFlash->GetOrigin(flash[0], flash[1], flash[2]);
+	if (FLT_MAX == flash[0]) {
+		if (!HasRecentFlashDetonate()) return;
+		memcpy(flash, g_LastFlashPos, sizeof(flash));
+	}
+	Effects_FlashRing(pPawn, flash);
+}
+
+// Some demos (e.g. tournament ones) have no player_blind events. There we take a new flash on the
+// target's pawn (the client only m_flFlashBangTime, the flash's end time, moving forward) together
+// with the last flashbang_detonate. Skipped when player_blind already handled it.
+static void Effects_OnFrame() {
+	static void * s_pPawn = nullptr;
+	static float s_flashBangTime = 0.0f;
+	ptrdiff_t ofs = g_clientDllOffsets.C_CSPlayerPawn.m_flFlashBangTime;
+	CEntityInstance * pPawn = 0 != ofs && g_PovEarRinging && IsPovActive() ? (CEntityInstance *)GetSwappedTargetPlayerPawn() : nullptr;
+	if (nullptr == pPawn) {
+		s_pPawn = nullptr;
+		return;
+	}
+	float flashBangTime = *(float *)((unsigned char *)pPawn + ofs);
+	bool bNewFlash = pPawn == s_pPawn && s_flashBangTime + 0.001f < flashBangTime;
+	s_pPawn = pPawn;
+	s_flashBangTime = flashBangTime;
+	if (!bNewFlash || !HasRecentFlashDetonate()) return;
+	if (0 <= g_LastBlindTick && abs(GetDemoTick() - g_LastBlindTick) <= 64) return;
+	Effects_FlashRing(pPawn, g_LastFlashPos);
 }
 
 // HE deafen: blast damage of 30 or more.

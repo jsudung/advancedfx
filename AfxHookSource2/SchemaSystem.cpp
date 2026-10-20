@@ -132,6 +132,8 @@ void initSchemaSystemOffsets()
 	getOffset(&g_clientDllOffsets.CCSPlayerController.m_pInGameMoneyServices, "client.dll", "CCSPlayerController", "m_pInGameMoneyServices");
 	getOffset(&g_clientDllOffsets.CCSPlayerController_InGameMoneyServices.m_iAccount, "client.dll", "CCSPlayerController_InGameMoneyServices", "m_iAccount");
 	getOffset(&g_clientDllOffsets.C_CSPlayerPawn.m_szLastPlaceName, "client.dll", "C_CSPlayerPawn", "m_szLastPlaceName");
+	if (!getOffset(&g_clientDllOffsets.C_CSPlayerPawn.m_flFlashBangTime, "client.dll", "C_CSPlayerPawn", "m_flFlashBangTime"))
+		getOffset(&g_clientDllOffsets.C_CSPlayerPawn.m_flFlashBangTime, "client.dll", "C_CSPlayerPawnBase", "m_flFlashBangTime");
 }
 
 void HookSchemaSystem(HMODULE schemaSystemDll)

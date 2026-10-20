@@ -469,6 +469,12 @@ What we do:
 
 - On the target's `player_blind`: distance from the flashbang entity (`entityid`, or the last
   `flashbang_detonate`) to the eye position, then trigger the deafen control and play the ring.
+- Some demos have no `player_blind` at all (StarLadder Vitality vs FURIA: event declared, 0
+  fired, 144 `flashbang_detonate`). The whiteout still works because it comes from the pawn's
+  networked flash fields. Fallback: each frame, when the target pawn's client-only
+  `m_flFlashBangTime` (the flash's end time) moves forward, ring by the distance to the last
+  `flashbang_detonate` (within 64 ticks). It's skipped when a `player_blind` for the target came
+  in the last 64 ticks.
 - On the target's HE `player_hurt` with `dmg_health + dmg_armor >= 30`: Long ring plus
   `control.deafenHE`.
 - On `bomb_exploded`: if the target pawn is on the ground (`m_fFlags & FL_ONGROUND`), shake

@@ -76,6 +76,7 @@ struct ClientDllOffsets_t {
 	struct C_CSPlayerPawn {
 		ptrdiff_t m_bIsBuyMenuOpen = 0; // bool, optional (0 if not found)
 		ptrdiff_t m_szLastPlaceName = 0; // char[18], optional (0 if not found)
+		ptrdiff_t m_flFlashBangTime = 0; // float32 (client only), optional (0 if not found)
 	} C_CSPlayerPawn;
 
 	struct C_BasePlayerPawn {
