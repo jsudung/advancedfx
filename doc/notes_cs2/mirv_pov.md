@@ -92,6 +92,22 @@ follow the POV player, also when seeking to a moment where they're dead.
 
 Technical background and findings: `mirv_pov_study.md`, `mirv_pov_spike.md`.
 
+## After a CS2 update
+
+Check the signatures against the installed game without starting it (standard library only):
+
+```
+python misc/mirv_pov_sigcheck.py [--cs2 "<...>\Counter-Strike Global Offensive"]
+```
+
+It checks that every signature in `MirvPov.cpp` matches exactly once in client.dll / engine2.dll,
+replays the checks each hook does on what it matched, and prints the offsets it reads (compare
+with the previous run). A failing `CORE` line disables POV; any other failure disables just that
+feature. When a hook changes in `MirvPov.cpp`, update its check in the script too. In game,
+`mirv_pov info` and the `mirv_pov: ... not found` console warnings show the same.
+
+Last run: client.dll / engine2.dll of 2026-10-23, 46/46 OK, offsets unchanged since 2026-10-19.
+
 ## Status (CS2 1.41.9.1, 2026-10-19)
 
 Tested in game on a Valve MM demo and a pro tournament demo.
